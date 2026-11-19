@@ -10,6 +10,11 @@ PC's VR picture through [WiVRn](https://github.com/WiVRn/WiVRn).
 enough to play with. See [What works and what does not](#what-works-and-what-does-not)
 before you spend an evening on it.
 
+![The hub's 3D view: a stick figure with both hands, and the cameras around it](docs/3d-view.png)
+
+*The hub's web page, 3D view: the tracked body and hands, the cameras where calibration
+put them, and how well each camera agrees with the others.*
+
 ## How it works
 
 ```
