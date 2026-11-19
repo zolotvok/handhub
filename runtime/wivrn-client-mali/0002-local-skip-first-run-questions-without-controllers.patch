@@ -1,0 +1,20 @@
+diff --git a/client/scenes/lobby.cpp b/client/scenes/lobby.cpp
+index 70a8c56..6257cd8 100644
+--- a/client/scenes/lobby.cpp
++++ b/client/scenes/lobby.cpp
+@@ -171,8 +171,14 @@ scenes::lobby::lobby() :
+ 
+ 	apply_theme_settings();
+ 
++	// HandHub local change: a Cardboard viewer has no pointer to answer the
++	// first-run questions (microphone, eye/face/body tracking), so skip them
++	// and keep those features off.
+ 	if (config.first_run)
+-		current_tab = tab::first_run;
++	{
++		config.first_run = false;
++		config.save();
++	}
+ 
+ 	const auto keypair_path = application::get_config_path() / "private_key.pem";
+ 	try

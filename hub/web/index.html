@@ -1,0 +1,365 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later
+     Copyright (C) 2026 Schmiz Otto -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>HandHub</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-row">
+    <h1 class="brand">HandHub</h1>
+    <div class="chips" role="group" aria-label="Status">
+      <span class="chip" id="chip-runtime" data-s="off"><span class="dot" aria-hidden="true"></span><span class="chip-label">Runtime</span><span class="chip-state">...</span></span>
+      <span class="chip" id="chip-hmd" data-s="off"><span class="dot" aria-hidden="true"></span><span class="chip-label">VR headset</span><span class="chip-state">...</span></span>
+      <!-- one chip per camera (id chip-<camera id>, see CAMS in app.js); the headset and infrared ones show only while that camera is enabled -->
+      <span class="chip" id="chip-webcam" data-s="off"><span class="dot" aria-hidden="true"></span><span class="chip-label">Webcam</span><span class="chip-state">...</span></span>
+      <span class="chip" id="chip-phone" data-s="off"><span class="dot" aria-hidden="true"></span><span class="chip-label">Phone</span><span class="chip-state">...</span></span>
+      <span class="chip" id="chip-pico" data-s="off"><span class="dot" aria-hidden="true"></span><span class="chip-label">Pico</span><span class="chip-state">...</span></span>
+      <span class="chip" id="chip-headset" data-s="off" hidden><span class="dot" aria-hidden="true"></span><span class="chip-label">Headset</span><span class="chip-state">...</span></span>
+      <span class="chip" id="chip-ir" data-s="off" hidden><span class="dot" aria-hidden="true"></span><span class="chip-label">Infrared</span><span class="chip-state">...</span></span>
+      <span class="readout" id="readout">-- fps &middot; -- ms</span>
+    </div>
+  </div>
+  <div class="banner" id="banner" role="alert" hidden>Disconnected from hub &mdash; retrying</div>
+  <nav class="tabs" role="tablist" aria-label="Pages" id="tabs">
+    <button class="tab" role="tab" id="tab-cameras" aria-controls="page-cameras" aria-selected="false" tabindex="-1">Cameras</button>
+    <button class="tab" role="tab" id="tab-view" aria-controls="page-view" aria-selected="false" tabindex="-1">3D view</button>
+    <button class="tab" role="tab" id="tab-gestures" aria-controls="page-gestures" aria-selected="false" tabindex="-1">Gestures</button>
+    <button class="tab" role="tab" id="tab-smoothing" aria-controls="page-smoothing" aria-selected="false" tabindex="-1">Smoothing</button>
+    <button class="tab" role="tab" id="tab-calibration" aria-controls="page-calibration" aria-selected="false" tabindex="-1">Calibrate</button>
+  </nav>
+</header>
+
+<main>
+
+<!-- 1. Cameras: the wall (one #tpl-tile per camera), hand lines and the calibration strip fill the first screen;
+     the settings below are one collapsible section per camera, built from #tpl-cam (see CAMS in app.js) -->
+<section id="page-cameras" role="tabpanel" aria-labelledby="tab-cameras" hidden>
+  <h2 class="sr-only">Cameras</h2>
+  <div class="cam-top" id="camTop">
+    <div class="wall-grid" id="camWall" role="group" aria-label="Live camera previews"></div>
+    <div class="live-lines" aria-label="What is tracked right now">
+      <p class="live-line hand-L" id="lineL"><b class="key">L</b><span><b>Left hand:</b> <span id="lineLText">--</span></span></p>
+      <p class="live-line hand-R" id="lineR"><b class="key">R</b><span><b>Right hand:</b> <span id="lineRText">--</span></span></p>
+      <p class="live-line" id="lineHead" hidden><b class="key">H</b><span><b>Head:</b> <span id="lineHeadText">--</span></span></p>
+    </div>
+    <section class="card multi-strip" aria-labelledby="multiStripTitle">
+      <h3 id="multiStripTitle">Calibrate cameras to each other</h3>
+      <div class="multi-host" data-calib="cameras" data-multi="strip"></div>
+    </section>
+    <section class="card multi-strip" id="headStrip" aria-labelledby="headStripTitle" hidden>
+      <h3 id="headStripTitle">Headset camera calibration</h3>
+      <div class="multi-host" data-calib="headset" data-multi="strip"></div>
+    </section>
+  </div>
+  <div class="cam-sections" id="camSections"></div>
+</section>
+
+<!-- 2. 3D view: one big perspective canvas (drawn by render3d, own small projection) with the tracking status beside it -->
+<section id="page-view" role="tabpanel" aria-labelledby="tab-view" hidden>
+  <h2 class="sr-only">3D view</h2>
+  <div class="view-wrap">
+    <div class="view-stage">
+      <canvas id="view3d" tabindex="0" role="img" aria-describedby="viewHint"
+        aria-label="3D room view: you as a stick figure with your hands, and the cameras. Drag to turn the view, wheel or pinch to zoom; with this focused, arrow keys turn it and plus and minus zoom."></canvas>
+      <div class="view-bar" id="viewBar" role="group" aria-label="View">
+        <button type="button" class="btn small" data-preset="front" aria-pressed="false">Front</button>
+        <button type="button" class="btn small" data-preset="side" aria-pressed="false">Side</button>
+        <button type="button" class="btn small" data-preset="top" aria-pressed="false">Top</button>
+        <label class="switch"><input type="checkbox" role="switch" id="viewFollow" checked><span class="track" aria-hidden="true"></span><span>Follow</span></label>
+      </div>
+      <p class="view-hint" id="viewHint">Drag to turn &middot; wheel or pinch to zoom</p>
+    </div>
+    <aside class="view-status" aria-label="What is tracked">
+      <p class="live-line" id="vsBody" data-on="0"><b class="key">B</b><span><b>Body:</b> <span id="vsBodyText">--</span></span></p>
+      <p class="live-line" id="vsHead" data-on="0" hidden><b class="key">H</b><span><b>Head:</b> <span id="vsHeadText">--</span></span></p>
+      <p class="live-line hand-L" id="vsL" data-on="0"><b class="key">L</b><span><b>Left hand:</b> <span id="vsLText">--</span></span></p>
+      <p class="live-line hand-R" id="vsR" data-on="0"><b class="key">R</b><span><b>Right hand:</b> <span id="vsRText">--</span></span></p>
+      <h3>Camera agreement</h3>
+      <ul class="agree-list" id="vsCams" aria-label="How well each camera agrees with the others"></ul>
+      <p class="hint view-legend">Blue = left side, orange = right side. Grey pyramids = cameras, thin lines = cameras that see a hand. Green tick = where the nose points. Grid = 0.5 m.</p>
+    </aside>
+  </div>
+</section>
+
+<!-- 3. Gestures -->
+<section id="page-gestures" role="tabpanel" aria-labelledby="tab-gestures" hidden>
+  <h2>Gestures</h2>
+  <div class="gesture-grid">
+    <article class="card g-profile">
+      <fieldset>
+        <legend>How should your hand control the buttons?</legend>
+        <label class="option">
+          <input type="radio" name="profile" value="gesture" data-path="gestures.profile">
+          <span><b>Gesture</b><small>Pinch thumb and index finger to click the trigger, make a fist to grip. Touch your thumb to the middle or ring finger for A or B.</small></span>
+        </label>
+        <label class="option">
+          <input type="radio" name="profile" value="finger" data-path="gestures.profile">
+          <span><b>Finger tracking</b><small>Each finger works like a real controller: bend your index finger for the trigger, and the other fingers for the grip. No A or B.</small></span>
+        </label>
+      </fieldset>
+    </article>
+
+    <article class="card g-live">
+      <h3>Live hand values</h3>
+      <div id="liveHands"></div>
+      <p class="hint">Solid line = click level. Dashed line = release level. Bars go from 0 (open) to 1 (closed).</p>
+    </article>
+
+    <article class="card g-test">
+      <h3>Test area</h3>
+      <p class="hint">Pinch or make a fist. Each tile lights up and counts one click when its button goes down.</p>
+      <div id="tiles"></div>
+      <button type="button" class="btn" id="resetClicks">Reset counters</button>
+    </article>
+
+    <article class="card g-sliders">
+      <h3>Trigger</h3>
+      <div data-group="gest-trigger"></div>
+      <h3>Grip</h3>
+      <div data-group="gest-grip"></div>
+      <h3>Pinch (Gesture mode)</h3>
+      <div data-group="gest-pinch"></div>
+      <h3>Finger bend</h3>
+      <div data-group="gest-curl"></div>
+    </article>
+  </div>
+</section>
+
+<!-- 4. Smoothing -->
+<section id="page-smoothing" role="tabpanel" aria-labelledby="tab-smoothing" hidden>
+  <h2>Smoothing</h2>
+  <div class="grid2">
+    <article class="card">
+      <h3>Filter</h3>
+      <div data-group="smooth"></div>
+    </article>
+    <article class="card">
+      <h3>Jitter</h3>
+      <p class="hint">Hold your hands still. Jitter is how much the hand position shakes over the last second. Lower is smoother.</p>
+      <div class="readouts">
+        <div class="readout-card hand-L"><b class="key">L</b> <span>Left hand</span> <span class="mono" id="jitL">--</span></div>
+        <div class="readout-card hand-R"><b class="key">R</b> <span>Right hand</span> <span class="mono" id="jitR">--</span></div>
+      </div>
+      <canvas id="jitterGraph" class="graph" role="img" aria-label="Jitter in millimetres over the last 10 seconds"></canvas>
+    </article>
+  </div>
+</section>
+
+<!-- 5. Calibration -->
+<section id="page-calibration" role="tabpanel" aria-labelledby="tab-calibration" hidden>
+  <h2>Calibration</h2>
+  <article class="card multi">
+    <h3>Calibrate cameras to each other</h3>
+    <p data-calib-text="cameras">Walk slowly around the play area for 30 seconds and pause for a moment in several places, arms a little away from your body. Your whole body is used, so keep your feet in view of the side cameras.</p>
+    <p class="hint">After you press Start there is a 3 second countdown so you can get into position. The same control is under the previews on the Cameras tab.</p>
+    <div class="multi-host" data-calib="cameras" data-multi="card"></div>
+  </article>
+  <article class="card multi" id="headCard">
+    <h3>Headset camera calibration</h3>
+    <p data-calib-text="headset">Hold the headset to your face as if wearing it. Keep one hand in front of you where the headset camera and at least two other cameras can see it, and slowly turn your head: left and right, up and down, tilt.</p>
+    <p class="hint">After you press Start there is a 3 second countdown so you can get into position. This needs the headset camera to be on and a VR app to be running. The same control is under the previews on the Cameras tab while the headset camera is on.</p>
+    <div class="multi-host" data-calib="headset" data-multi="card"></div>
+  </article>
+  <div class="grid2">
+    <article class="card" id="levelCard">
+      <h3>Standing calibration</h3>
+      <div class="field">
+        <div class="field-head"><label for="userHeight">Your height (cm)</label></div>
+        <input type="number" id="userHeight" data-path="tracking.user_height_m" data-scale="100" data-empty="0" min="100" max="250" step="1" inputmode="numeric" placeholder="not set">
+        <small class="hint">Optional. With your height the 3D size of the room is corrected too. Leave empty if you do not know it.</small>
+      </div>
+      <p>Stand upright in the play area, facing the laptop, where two cameras can see you from head to foot.</p>
+      <p class="hint">Sets the camera tilt from your upright body. After you press Start there is a 3 second countdown so you can get into position.</p>
+      <div class="countdown" id="levelCount" aria-live="assertive"></div>
+      <button type="button" class="btn primary" id="levelBtn">Start countdown</button>
+      <p class="result" id="levelResult" role="status" hidden></p>
+    </article>
+    <article class="card">
+      <h3>Anchor hands to head</h3>
+      <p>Hold both hands beside your head, palms toward the camera, thumb tips touching your temples.</p>
+      <p class="hint">Use this when the hands appear in the wrong place, for example behind you. The pose is taken after a 3 second countdown. In the playground, the C key does the same.</p>
+      <div class="countdown" id="headCount" aria-live="assertive"></div>
+      <button type="button" class="btn primary" id="headBtn">Start countdown</button>
+      <p class="result" id="headResult" role="status" hidden></p>
+    </article>
+    <article class="card">
+      <h3>Set rest pose</h3>
+      <p>Hold both hands in front of your chest.</p>
+      <p class="hint">Press the button, then get into position. The pose is taken after a 3 second countdown.</p>
+      <div class="countdown" id="restCount" aria-live="assertive"></div>
+      <button type="button" class="btn primary" id="restBtn">Start countdown</button>
+      <p class="result" id="restResult" role="status" hidden></p>
+    </article>
+    <article class="card">
+      <h3>Align headset</h3>
+      <p>Look straight at the camera.</p>
+      <p class="hint">Then press the button. This needs the headset to be connected.</p>
+      <button type="button" class="btn primary" id="alignBtn">Align now</button>
+      <p class="result" id="alignResult" role="status" hidden></p>
+      <p>Current yaw offset: <b class="mono" id="yawNow">--</b></p>
+    </article>
+  </div>
+</section>
+
+</main>
+
+<!-- one tile of the camera wall: the only place a preview image lives -->
+<template id="tpl-tile">
+  <figure class="cam-tile">
+    <div class="shot">
+      <img data-t="img" alt="">
+      <div class="shot-empty" data-t="empty">Off</div>
+      <p class="shot-warn" data-t="warn" aria-live="polite" hidden></p>
+    </div>
+    <figcaption class="tile-cap">
+      <div class="tile-row">
+        <b class="tile-name" data-t="name"></b>
+        <span class="seen" role="group" aria-label="Hands this camera sees">
+          <span class="hand-badge hand-L" data-t="seeL" data-on="0" role="img" aria-label="Left hand: not seen">L</span>
+          <span class="hand-badge hand-R" data-t="seeR" data-on="0" role="img" aria-label="Right hand: not seen">R</span>
+          <span class="hand-badge count" data-t="seeN" data-on="0" hidden>--</span>
+        </span>
+      </div>
+      <div class="tile-row">
+        <span class="chip" data-t="online" data-s="off"><span class="dot" aria-hidden="true"></span><span class="chip-state">Off</span></span>
+        <span class="tile-fps"><b data-t="fps">--</b> fps</span>
+        <span class="chip" data-t="agree" data-s="off" hidden><span class="dot" aria-hidden="true"></span><span class="chip-state">--</span></span>
+        <span class="chip" data-t="calib" data-s="off" data-only="phone pico headset"><span class="dot" aria-hidden="true"></span><span class="chip-state">Not calibrated</span></span>
+        <span class="chip" data-t="fixed" data-s="ok" data-only="ir" title="This camera sits next to the webcam and looks the same way, so it never needs calibrating."><span class="dot" aria-hidden="true"></span><span class="chip-state">Fixed to webcam</span></span>
+      </div>
+    </figcaption>
+  </figure>
+</template>
+
+<!-- settings and details of one camera, collapsed by default -->
+<template id="tpl-cam">
+  <details class="card cam-card">
+    <summary><span data-r="title"></span><small>Settings and details</small></summary>
+    <div class="cam-body">
+      <div class="cam-view">
+        <p class="hint calib-hint" data-r="calibHint" data-only="phone pico" hidden>Not calibrated yet, so this camera is not used for the hand pose. Run &ldquo;Calibrate cameras to each other&rdquo; under the previews or on the Calibrate tab.</p>
+        <p class="hint calib-hint" data-r="calibHint" data-only="headset" hidden>Not calibrated yet, so this camera is not used for the hand pose. Run &ldquo;Headset camera calibration&rdquo; under the previews or on the Calibrate tab.</p>
+        <p class="hint calib-hint" data-only="ir">Sits next to the webcam and looks the same way, so it never needs calibrating. It lights its own scene with infrared and delivers about 7 usable frames per second.</p>
+        <ul class="warnings" aria-live="polite">
+          <li class="notice err" data-r="err" hidden></li>
+          <li class="notice warn" data-r="dark" hidden>Too dark</li>
+          <li class="notice warn" data-r="small" data-only="webcam" hidden>Hand is small in frame &mdash; move closer</li>
+        </ul>
+        <dl class="stats">
+          <div><dt>Processed fps</dt><dd data-r="fps">--</dd></div>
+          <div><dt>Camera fps</dt><dd data-r="capFps">--</dd></div>
+          <div><dt>Tracker time</dt><dd data-r="proc">--</dd></div>
+          <div><dt>Latency</dt><dd data-r="latency">--</dd></div>
+          <div><dt>Resolution</dt><dd data-r="size">--</dd></div>
+          <div><dt>Hands seen</dt><dd data-r="seen">--</dd></div>
+          <div><dt>Brightness</dt><dd data-r="bright">--</dd></div>
+        </dl>
+        <dl class="stats" data-only="webcam">
+          <div><dt>Left hand confidence</dt><dd data-r="confL">--</dd></div>
+          <div><dt>Left hand height</dt><dd data-r="heightL">--</dd></div>
+          <div><dt>Right hand confidence</dt><dd data-r="confR">--</dd></div>
+          <div><dt>Right hand height</dt><dd data-r="heightR">--</dd></div>
+        </dl>
+      </div>
+
+      <div class="cam-controls">
+        <fieldset>
+          <legend>Settings</legend>
+          <label class="switch"><input type="checkbox" role="switch" data-key="enabled"><span class="track" aria-hidden="true"></span><span>Enable camera</span></label>
+          <label class="switch"><input type="checkbox" role="switch" data-key="mirror_preview"><span class="track" aria-hidden="true"></span><span>Mirror preview</span></label>
+          <label class="switch"><input type="checkbox" role="switch" data-key="swap_hands"><span class="track" aria-hidden="true"></span><span>Swap left and right hands</span></label>
+          <div class="field" data-only="webcam">
+            <div class="field-head"><label for="cam-device">Device</label></div>
+            <div class="row">
+              <select id="cam-device" data-key="device" data-r="device"></select>
+              <button type="button" class="btn small" data-act="refresh">Refresh</button>
+            </div>
+          </div>
+          <div class="field" data-only="phone headset">
+            <div class="field-head"><label for="cam-serial">Phone</label></div>
+            <div class="row">
+              <select id="cam-serial" data-key="serial" data-type="text" data-r="serial"></select>
+              <button type="button" class="btn small" data-act="refresh">Refresh</button>
+            </div>
+          </div>
+          <div class="field" data-only="phone headset">
+            <div class="field-head"><label for="cam-camid">Camera on the phone</label></div>
+            <select id="cam-camid" data-key="camera_id" data-type="text" data-r="camId"></select>
+          </div>
+          <div class="field" data-only="headset">
+            <div class="field-head"><label for="cam-zoom">Zoom</label></div>
+            <select id="cam-zoom" data-key="zoom" data-r="zoom"></select>
+          </div>
+          <label class="switch" data-only="phone"><input type="checkbox" role="switch" data-key="torch"><span class="track" aria-hidden="true"></span><span>Flash light</span></label>
+          <div class="field" data-only="pico">
+            <div class="field-head"><label for="cam-port">Serial port</label></div>
+            <input type="text" id="cam-port" data-key="port" data-type="text" placeholder="/dev/ttyACM0" spellcheck="false" autocomplete="off" autocapitalize="off">
+          </div>
+          <div class="field" data-only="pico">
+            <div class="field-head"><label for="cam-speed">Sensor speed</label></div>
+            <select id="cam-speed" data-key="xclk_div" data-r="speed"></select>
+          </div>
+          <div class="field">
+            <div class="field-head"><label for="cam-rotate">Rotate image</label></div>
+            <select id="cam-rotate" data-key="rotate_deg" data-r="rotate"></select>
+          </div>
+          <div class="field">
+            <div class="field-head"><label for="cam-light">Light correction</label></div>
+            <select id="cam-light" data-key="light_correction" data-type="text" data-r="light"></select>
+            <small class="hint">Makes a dark picture easier for the tracker. &ldquo;Brighten + even out&rdquo; also balances bright and dark areas.</small>
+          </div>
+          <div data-group="main"></div>
+        </fieldset>
+        <fieldset data-only="webcam">
+          <legend>Camera position (from your eyes)</legend>
+          <div data-group="pos"></div>
+        </fieldset>
+        <fieldset data-only="webcam">
+          <legend>Camera angle</legend>
+          <div data-group="angle"></div>
+        </fieldset>
+        <fieldset data-only="webcam">
+          <legend>Hand size</legend>
+          <div data-group="hand"></div>
+        </fieldset>
+      </div>
+    </div>
+  </details>
+</template>
+
+<!-- the controls of a calibration that the hub collects over time (the camera-to-camera one and the headset camera one): mounted twice each
+     (strip on the Cameras tab, card on the Calibrate tab), see COLLECTORS and renderCollector() in app.js -->
+<template id="tpl-multi">
+  <div class="multi-ui">
+    <div class="multi-main">
+      <button type="button" class="btn primary" data-r="btn">Start</button>
+      <div class="multi-count" data-r="count" aria-live="assertive" hidden>
+        <b class="multi-num" data-r="countNum">3</b><span>Get into position. Collecting starts at 0.</span>
+      </div>
+      <div class="multi-left" data-r="left" hidden>
+        <b class="multi-num" data-r="leftNum">--</b><span data-r="leftUnit">s left</span>
+      </div>
+      <progress data-r="bar" max="30" value="0" aria-label="Time left in the collection" hidden></progress>
+      <p class="hint multi-note" data-r="note" role="status" hidden></p>
+      <p class="result" data-r="error" role="status" hidden></p>
+      <p class="result" data-r="result" role="status" hidden></p>
+    </div>
+    <p class="hint multi-hint" data-r="hint" data-only="strip"></p>
+    <ul class="rows" data-r="pairs" aria-label="Samples collected per camera pair" hidden></ul>
+    <ul class="rows" data-r="cams" aria-label="Result per camera" hidden></ul>
+  </div>
+</template>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+</body>
+</html>

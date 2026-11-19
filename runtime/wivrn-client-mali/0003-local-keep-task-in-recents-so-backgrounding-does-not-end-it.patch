@@ -1,0 +1,13 @@
+diff --git a/AndroidManifest.xml b/AndroidManifest.xml
+index a2441b0..c597da2 100644
+--- a/AndroidManifest.xml
++++ b/AndroidManifest.xml
+@@ -119,7 +119,7 @@
+             android:exported="true"
+             android:name="org.meumeu.wivrn.MainActivity"
+             android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode|density"
+-            android:excludeFromRecents="true"
++            android:excludeFromRecents="false"
+             android:launchMode="singleTask"
+             android:resizeableActivity="false"
+             android:screenOrientation="landscape"

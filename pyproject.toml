@@ -1,0 +1,36 @@
+[project]
+name = "handhub"
+version = "0.1.0"
+description = "Multi-camera optical hand tracking hub for Cardboard-style PC VR"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "mediapipe>=1.2",
+    "opencv-python-headless>=4.10",
+    "numpy>=2",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "av>=12",         # decodes the phone cameras' H.264 streams
+    "pyserial>=3.5",  # the Pico camera
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27", "websockets>=12"]
+
+[project.scripts]
+handhub = "hub.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hub", "hub.cameras", "hub.tracking"]
+
+[tool.setuptools.package-data]
+hub = ["web/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

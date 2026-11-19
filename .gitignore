@@ -1,0 +1,36 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Godot
+playground/.godot/
+playground/*.uid.bak
+
+# Recordings, logs and calibration dumps: they contain camera pictures of people and rooms
+logs/
+recordings/
+*.pkl
+*.mp4
+
+# Android signing material and local build settings (never commit these)
+*.keystore
+*.jks
+gradle.properties
+local.properties
+
+# Downloaded third-party binaries and source checkouts
+third_party/
+/tools/godot/
+/tools/scrcpy/
+*.apk
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

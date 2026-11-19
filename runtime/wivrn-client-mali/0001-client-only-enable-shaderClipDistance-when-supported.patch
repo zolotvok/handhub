@@ -1,0 +1,27 @@
+diff --git a/client/application.cpp b/client/application.cpp
+index cf46e87..71df25f 100644
+--- a/client/application.cpp
++++ b/client/application.cpp
+@@ -965,8 +965,21 @@ void application::initialize_vulkan()
+ 	        .pQueuePriorities = &queuePriority,
+ 	};
+ 
++	// shaderClipDistance is only used by the HTC ray shaders (gl_ClipDistance),
++	// and some drivers (e.g. ARM Mali) do not support it: requesting it
++	// unconditionally makes device creation fail with VK_ERROR_FEATURE_NOT_PRESENT
++	const bool has_clip_distance = vk_physical_device.getFeatures().shaderClipDistance;
++	const bool need_clip_distance = runtime_hmd_traits.override_shader.contains("ray.vert");
++	if (not has_clip_distance)
++	{
++		if (need_clip_distance)
++			spdlog::warn("shaderClipDistance is required by the ray shaders but not supported by the device");
++		else
++			spdlog::info("shaderClipDistance is not supported, not enabling it");
++	}
++
+ 	vk::PhysicalDeviceFeatures device_features{
+-	        .shaderClipDistance = true,
++	        .shaderClipDistance = has_clip_distance,
+ 	};
+ 
+ 	vk::StructureChain device_create_info{

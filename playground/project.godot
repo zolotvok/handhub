@@ -1,0 +1,32 @@
+; Engine configuration file.
+; HandHub VR playground: optically tracked hands + grabbable objects (no controllers).
+
+config_version=5
+
+[application]
+
+config/name="HandHub Playground"
+config/description="Test playground for the HandHub optical hand tracker"
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.7", "Mobile")
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+
+[physics]
+
+common/physics_ticks_per_second=90
+
+[rendering]
+
+renderer/rendering_method="mobile"
+renderer/rendering_method.mobile="mobile"
+environment/defaults/default_clear_color=Color(0.45, 0.62, 0.78, 1)
+
+[xr]
+
+openxr/enabled=true
+openxr/startup_alert=false
+shaders/enabled=true

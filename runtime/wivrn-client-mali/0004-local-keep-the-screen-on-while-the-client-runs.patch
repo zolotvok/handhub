@@ -1,0 +1,15 @@
+diff --git a/client/java/MainActivity.java b/client/java/MainActivity.java
+index e02230e..9a59f8e 100644
+--- a/client/java/MainActivity.java
++++ b/client/java/MainActivity.java
+@@ -24,6 +24,10 @@ public class MainActivity extends android.app.NativeActivity
+ 	{
+ 		super.onCreate(savedInstanceState);
+ 
++		// HandHub local change: in a phone viewer nothing touches the screen, so the phone
++		// would count VR as idle time, turn the screen off and lock.
++		getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
++
+ 		this.BatteryInfoReceiver = new BroadcastReceiver();
+ 		this.netcb = new org.meumeu.wivrn.NetworkInfoCallback();
+ 
