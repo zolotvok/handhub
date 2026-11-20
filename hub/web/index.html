@@ -165,8 +165,8 @@
   </article>
   <article class="card multi" id="headCard">
     <h3>Headset camera calibration</h3>
-    <p data-calib-text="headset">Hold the headset to your face as if wearing it. Keep one hand in front of you where the headset camera and at least two other cameras can see it, and slowly turn your head: left and right, up and down, tilt.</p>
-    <p class="hint">After you press Start there is a 3 second countdown so you can get into position. This needs the headset camera to be on and a VR app to be running. The same control is under the previews on the Cameras tab while the headset camera is on.</p>
+    <p data-calib-text="headset">Nothing to press. Wear the headset, keep one hand where the headset camera and at least two other cameras can see it, and look around a little.</p>
+    <p class="hint">The hub learns where the headset camera sits by itself and keeps it up to date while it runs. Looking around makes that faster. Press &ldquo;Learn again&rdquo; only if the phone was put back into the headset differently. This needs the headset camera to be on and a VR app to be running. The same status is under the previews on the Cameras tab while the headset camera is on.</p>
     <div class="multi-host" data-calib="headset" data-multi="card"></div>
   </article>
   <div class="grid2">
@@ -247,7 +247,7 @@
     <div class="cam-body">
       <div class="cam-view">
         <p class="hint calib-hint" data-r="calibHint" data-only="phone pico" hidden>Not calibrated yet, so this camera is not used for the hand pose. Run &ldquo;Calibrate cameras to each other&rdquo; under the previews or on the Calibrate tab.</p>
-        <p class="hint calib-hint" data-r="calibHint" data-only="headset" hidden>Not calibrated yet, so this camera is not used for the hand pose. Run &ldquo;Headset camera calibration&rdquo; under the previews or on the Calibrate tab.</p>
+        <p class="hint calib-hint" data-r="calibHint" data-only="headset" hidden>Not calibrated yet, so this camera is not used for the hand pose. The hub learns this by itself: wear the headset, keep a hand where this camera and two other cameras can see it, and look around a little. The status is under the previews and on the Calibrate tab.</p>
         <p class="hint calib-hint" data-only="ir">Sits next to the webcam and looks the same way, so it never needs calibrating. It lights its own scene with infrared and delivers about 7 usable frames per second.</p>
         <ul class="warnings" aria-live="polite">
           <li class="notice err" data-r="err" hidden></li>
@@ -336,8 +336,8 @@
   </details>
 </template>
 
-<!-- the controls of a calibration that the hub collects over time (the camera-to-camera one and the headset camera one): mounted twice each
-     (strip on the Cameras tab, card on the Calibrate tab), see COLLECTORS and renderCollector() in app.js -->
+<!-- the controls of a calibration that the hub collects over time (the camera-to-camera one, and the headset camera one that is only a live status
+     with a "Learn again" button): mounted twice each (strip on the Cameras tab, card on the Calibrate tab), see COLLECTORS and renderCollector() in app.js -->
 <template id="tpl-multi">
   <div class="multi-ui">
     <div class="multi-main">

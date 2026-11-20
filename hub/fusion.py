@@ -30,6 +30,23 @@ REST_TARGET = np.array([0.0, -0.35, -0.35])  # body frame, where "hands in front
 HEAD_HALF_WIDTH = 0.075  # eye-centre to temple, metres
 TEMPLE_Z = 0.02  # temples sit slightly behind the eyes (+z is backwards)
 VIEW_MAX_AGE_S = 0.07  # a view older than this is not combined with a newer one
+# The head camera is fitted to the fixed cameras all the time (see _headfit_solve).
+HEADFIT_WINDOW_S = 45.0      # sightings older than this are forgotten
+HEADFIT_EVERY_S = 3.0        # how often the fit is redone
+HEADFIT_MIN_SIGHTINGS = 60
+HEADFIT_GOOD_DEG = 3.0       # a fit worse than this is not used
+HEADFIT_LOST_DEG = 7.0       # the fit in use disagrees this much with fresh sightings: drop it
+HEADFIT_MAX_AGE_S = 300.0    # without fresh sightings the headset's heading may have drifted
+HEADFIT_FULL_TURN_DEG = 25.0  # the head must have turned this much to tell A from B
+HEADFIT_PAIR_MAX_AGE_S = 0.12
+VIEW_PREDICT_MAX_S = 0.10    # a view is carried forward along its own motion by at most this long
+# Different cameras, and different ways of combining them, put the same hand a few
+# centimetres apart, and which of them reports changes from frame to frame. The hand
+# must not hop between their opinions: on a change of source it stays where it was and
+# then drifts to the new source's place over this long.
+HANDOVER_TAU_S = 0.4
+HANDOVER_MAX_M = 0.20        # further apart than this is a real correction, taken at once
+HEAD_SHAPE_HOLD_S = 0.25     # fingers stay as the head camera last saw them for this long
 TRIANGULATION_MAX_RMS_PX = 20.0
 HEAD_IDX = [0, 2, 5, 7, 8, 9, 10]  # head landmarks within the 33 pose landmarks
 SINGLE_KEEP_RANGE_S = 0.6  # a single view keeps the hand's last known distance this long
@@ -75,6 +92,15 @@ class View:
     world: np.ndarray  # (21, 3) MediaPipe metric landmarks
     score: float
     ext: tuple | None = None  # (R, t) at this moment, for a camera that moves
+    vel: np.ndarray | None = None  # (21, 2) pixels per second, from this camera's previous frame
+
+    def image_at(self, t: float) -> np.ndarray:
+        """The landmarks where they would be at time t. The cameras do not expose at the
+        same instant: a hand moving at 1 m/s is 5 cm further on in the 50 ms between two
+        of them, which combining the pictures as they are turns into a wrong distance."""
+        if self.vel is None:
+            return self.image
+        return self.image + self.vel * min(max(t - self.t, 0.0), VIEW_PREDICT_MAX_S)
 
 
 class HandTrack:
@@ -91,7 +117,13 @@ class HandTrack:
         self.lm_body = np.zeros((21, 3))
         self.lm_room = np.zeros((21, 3))
         self.lm_ref = np.zeros((21, 3))  # in the webcam's frame
-        self.ref_fixed = False
+        self.centre_fixed: np.ndarray | None = None  # palm centre from the fixed cameras only
+        self.centre_t = -1e9
+        self.path_key: tuple | None = None   # which cameras, combined how, gave the last pose
+        self.carry = np.zeros(3)             # see HANDOVER_TAU_S
+        self.head_shape: np.ndarray | None = None  # landmarks about the palm centre, as the head camera saw them
+        self.head_shape_t = -1e9
+        self.last_go = None                  # the gestures read from the head camera's view
         self.leaps = 0  # consecutive frames skipped as implausible leaps
         self.wrong_side = 0.0  # running evidence that this is really the other hand
         self.confidence = 0.0
@@ -129,6 +161,10 @@ class Hub:
         self.torso_seen = -1e9
         self.floor_samples: deque = deque(maxlen=300)
         self.floor_y: float | None = None  # room y of the floor (the webcam is y = 0)
+        # Eye heights seen lately: when no camera pair sees the feet, the floor is taken to
+        # be the user's own eye height below where their eyes are when standing upright.
+        self.eye_y_samples: deque = deque(maxlen=3600)
+        self.head_hand_ratios = [deque(maxlen=600), deque(maxlen=600)]  # see _learn_head_hand_scale
         self.body_ok = False  # the triangulated body currently looks like a body
         self.r_room = g.BASE_CAM_TO_BODY
         self.body_world: dict = {}  # camera -> (t, pose world landmarks (33, 3), visibility)
@@ -136,11 +172,21 @@ class Hub:
         self.raw_log: list | None = None  # raw recording in progress
         self.raw_until = 0.0
         self.raw_last: str | None = None
-        self.headcal: dict | None = None  # head-camera calibration in progress
-        self.headcal_result: dict | None = None
+        # The head camera's fit: {"a", "b", "off", "err_deg", "used", "t"} or None. Its
+        # mount (b, off) is remembered in the config; a (the VR runtime's heading against
+        # the room) is found afresh in every session.
+        self.headfit: dict | None = None
+        self.headfit_note = "waiting for a hand that the fixed cameras and the head camera both see"
+        self.head_sightings: deque = deque(maxlen=4000)  # (time, sighting no., d, x, m, h)
+        self._sighting_no = 0
+        self.headfit_mount_ok = False  # the mount was confirmed in this run, with the head turning
+        self.headfit_serial = 0  # goes up with every new fit: a refit is a change of source for the hands
+        self._headfit_next = 0.0
+        self._headfit_busy = False
+        self.headfit_sync = not start_camera  # replay and tests: solve in the calling thread
         self.agreement: dict = {}  # camera -> smoothed agreement with the others, pixels at 640 wide
         self.head_pos = np.zeros(3)  # eyes, in the webcam's frame
-        self.head_f = OneEuro(min_cutoff=0.5, beta=0.05)
+        self.head_f = OneEuro(min_cutoff=1.0, beta=0.5)  # steady when still, quick when crouching
         self.head_rot = np.array([1.0, 0.0, 0.0, 0.0])  # room axes, w x y z
         self.head_rot_f = OneEuroQuat(min_cutoff=0.6, beta=0.05)
         self.head_rot_t = 0.0
@@ -398,6 +444,9 @@ class Hub:
         self.head_pos = self.head_f(eyes, t) if t > self.head_t else self.head_pos
         self.head_t = max(t, self.head_t)
         self.head_seen = time.monotonic()
+        c = cfg["camera"]
+        self.eye_y_samples.append(float(
+            (g.cam_to_body_rotation(c["yaw_deg"], c["pitch_deg"], c["roll_deg"]) @ self.head_pos)[1]))
         self.head_mode, self.head_views_used = mode, used
 
     def camera_position(self, cfg: dict, r_cb: np.ndarray) -> np.ndarray:
@@ -493,7 +542,7 @@ class Hub:
         ext_all = self.extrinsics(cfg)
         pose = None
         if cam_cfg.get("moving"):
-            self._headcam_collect(cam, t, k, size, dets)
+            self._headfit_collect(cam, t, k, dets)
             pose = self._headcam_pose(cam_cfg, t)
             if pose is None:
                 return  # not calibrated, or the head or the headset's orientation is unknown
@@ -502,10 +551,17 @@ class Hub:
         # is. The opinion is only a vote: which detections in different cameras are the
         # same physical hand is decided from geometry in _associate().
         mine = []
+        t_prev, before = self.dets.get(cam, (-1e9, []))
         for is_right, (handed, score, image, world) in zip(labels, dets):
             if is_right is not None:
-                mine.append((View(t, k, np.asarray(image, float), np.asarray(world, float), float(score), pose),
-                             bool(is_right)))
+                v = View(t, k, np.asarray(image, float), np.asarray(world, float), float(score), pose)
+                # How the hand moves in this camera's picture, from the nearest hand in its
+                # previous frame (a camera's own left/right label is not steady enough).
+                if 0.0 < t - t_prev < 0.12 and before:
+                    old = min((b[0] for b in before), key=lambda b: float(np.linalg.norm(b.image[0] - v.image[0])))
+                    if float(np.linalg.norm(old.image[0] - v.image[0])) < 0.12 * size[0]:
+                        v.vel = (v.image - old.image) / (t - t_prev)
+                mine.append((v, bool(is_right)))
         self.dets[cam] = (t, mine)
 
         for idx, (score, image, world) in best.items():
@@ -553,7 +609,7 @@ class Hub:
                 if items[i][0] == items[j][0]:
                     continue
                 vi, vj = items[i][1], items[j][1]
-                pts, rms = mv.triangulate([(vi.k, *pose_of(i), vi.image, 1.0), (vj.k, *pose_of(j), vj.image, 1.0)])
+                pts, rms = mv.triangulate([(vi.k, *pose_of(i), vi.image_at(t), 1.0), (vj.k, *pose_of(j), vj.image_at(t), 1.0)])
                 if rms > TRIANGULATION_MAX_RMS_PX:
                     continue
                 lead = vi if vi.score >= vj.score else vj
@@ -679,7 +735,20 @@ class Hub:
             if geo is not None:
                 self.side_stats["shape"] += 1
             self.side_stats["groups"] += 1
-            if arm is not None and arm not in assigned and SIDE_PRIORITY == "body":
+            if (near and near[0][1] not in assigned and near[0][0] < 0.4
+                    and (len(near) == 1 or near[1][0] > 2.5 * near[0][0])):
+                # Right where one hand was a moment ago and well away from the other: it is
+                # that hand, whatever the skeleton or a label says in this one frame. (They
+                # are wrong for a frame now and then, which would make the two hands trade
+                # places and back. A hand truly on the wrong arm for a second or so is put
+                # right by _check_sides.)
+                idx = near[0][1]
+            elif (near and near[0][1] in assigned and near[0][0] < 0.4
+                  and (len(near) == 1 or near[1][0] > 2.5 * near[0][0])):
+                # A second sighting of a hand already placed in this frame (one camera's
+                # view of it that did not join the others): it is not the other hand.
+                continue
+            elif arm is not None and arm not in assigned and SIDE_PRIORITY == "body":
                 # The arm it is attached to: the skeleton knows its left from its right.
                 idx = arm
             elif geo is not None and int(geo) not in assigned:
@@ -733,13 +802,19 @@ class Hub:
     # ---- head-mounted camera ---------------------------------------------
     def _headcam_pose(self, cam_cfg: dict, t: float):
         """(R, centre) of the head camera in the webcam's frame at time t, or None."""
-        if not cam_cfg["calibrated"] or time.monotonic() - self.head_seen > HEAD_HOLD_S:
+        fit = self._headfit_usable()
+        if fit is None or time.monotonic() - self.head_seen > HEAD_HOLD_S:
             return None
         q = self.link.hmd_rot_at(t) if self.link.connected and self.link.hmd_valid else None
         if q is None:
             return None
-        a, b = np.array(cam_cfg["align"]).reshape(3, 3), np.array(cam_cfg["rot"]).reshape(3, 3)
-        return hc.camera_extrinsics(a, b, np.array(cam_cfg["tvec"]), g.matrix_from_quat(q), self.head_pos)
+        return hc.camera_extrinsics(fit["a"], fit["b"], fit["off"], g.matrix_from_quat(q), self.head_pos)
+
+    def _headfit_usable(self):
+        fit = self.headfit
+        if fit is None or fit["err_deg"] > HEADFIT_GOOD_DEG or time.monotonic() - fit["t"] > HEADFIT_MAX_AGE_S:
+            return None
+        return fit
 
     def _headcam_which_hands(self, dets: list, k: np.ndarray, size, pose: tuple, cam_cfg: dict) -> dict:
         """Left/right for the head camera's detections: {hand index: (score, image, world)}.
@@ -771,70 +846,125 @@ class Hub:
                 out[idx] = (score, image, world)
         return out
 
-    def calibrate_headcam_start(self, seconds: float = 25.0) -> dict:
+    def calibrate_headcam_start(self, seconds: float = 0.0) -> dict:
+        """Forget what is known about the head camera and learn it again (after the phone
+        was taken out of the viewer and put back differently, say). Learning needs no
+        ceremony: it happens whenever a hand is in view of two fixed cameras and the head
+        camera, and goes faster if the head turns meanwhile."""
         with self.lock:
             if not (self.link.connected and self.link.hmd_valid):
                 return {"ok": False, "error": "no headset orientation: the VR runtime and a VR app must be running"}
-            self.headcal = {"until": time.monotonic() + seconds, "samples": []}
-            self.headcal_result = None
+            self.headfit = None
+            self.headfit_mount_ok = False
+            self.head_sightings.clear()
+            self.headfit_note = "learning: hold a hand where the cameras and the headset see it, and look around"
+        for name, c in self.config.get()["extra_cameras"].items():
+            if c.get("moving"):
+                self.config.update({"extra_cameras": {name: {"calibrated": False}}})
         return {"ok": True, "seconds": seconds}
 
-    def _headcam_collect(self, cam: str, t: float, k: np.ndarray, size, dets: list) -> None:
-        """While calibrating: each head-camera view of a hand that the fixed cameras
-        have in 3D gives the head camera's true pose at that moment."""
-        if self.headcal is None:
-            return
+    def _headfit_collect(self, cam: str, t: float, k: np.ndarray, dets: list) -> None:
+        """Note where the head camera sees each palm, beside where the fixed cameras put
+        the palms at that moment, and refit the head camera now and then."""
         now = time.monotonic()
-        if now >= self.headcal["until"]:
-            self._headcam_finish(cam)
-            return
-        q = self.link.hmd_rot_at(t)
-        if q is None:
-            return
-        best = None
-        for _, _, image, _ in dets:
-            for h in self.hands:
-                if not (h.state.tracked and h.ref_fixed and now - h.last_seen < 0.08):
+        q = self.link.hmd_rot_at(t) if self.link.connected and self.link.hmd_valid else None
+        if q is not None and now - self.head_seen < 0.3:
+            m, k_inv = g.matrix_from_quat(q), np.linalg.inv(k)
+            # Which hand a sighting is must be known beforehand. Left to the fit, a still
+            # pair of hands fools it: "the left hand's picture is the right hand" is just
+            # as consistent as the truth, with the room turned by the angle between the
+            # hands. Seen from one's own head, the left hand is the one on the left; a
+            # single hand goes by the hand tracker's label.
+            order = sorted(dets, key=lambda det: float(np.asarray(det[2])[0][0]))
+            for n, det in enumerate(order):
+                if len(order) == 2:
+                    idx = n
+                elif len(order) == 1:
+                    idx = 1 if (det[0] == "Right") != bool(self.camera_configs(self.config.get())[cam]["swap_hands"]) else 0
+                else:
                     continue
-                sol = hc.camera_pose_from_hand(h.lm_ref, np.asarray(image, float), k)
-                if sol is not None and (best is None or sol[2] < best[2]):
-                    best = sol
-        if best is not None and best[2] < 10.0 * size[0] / 1280.0:
-            head_ok = now - self.head_seen < 0.5
-            self.headcal["samples"].append((best[0], best[1], g.matrix_from_quat(q), self.head_pos.copy(), head_ok))
+                hnd, lm = self.hands[idx], np.asarray(det[2], float)
+                w = 16 if idx == 1 else 15
+                if hnd.centre_fixed is not None and abs(t - hnd.centre_t) < HEADFIT_PAIR_MAX_AGE_S:
+                    px, where = lm[g.PALM_IDS, :2].mean(axis=0), hnd.centre_fixed.copy()
+                elif self.body_ok and now - self.body_seen[w] < 0.15:
+                    # No palm from two fixed cameras (often so for one of the hands): the
+                    # skeleton's wrist is coarser but there nearly always, and sightings of
+                    # both hands, far apart in the picture, are what pins the camera down.
+                    px, where = lm[0, :2], self.r_room.T @ self.body_pts[w]
+                else:
+                    continue
+                d = k_inv @ np.array([px[0], px[1], 1.0])
+                self._sighting_no += 1
+                self.head_sightings.append(
+                    (now, self._sighting_no, d / np.linalg.norm(d), where, m, self.head_pos.copy()))
+        if now >= self._headfit_next and not self._headfit_busy:
+            self._headfit_next = now + HEADFIT_EVERY_S
+            rows = [r for r in self.head_sightings if now - r[0] < HEADFIT_WINDOW_S]
+            if len({r[1] for r in rows}) >= HEADFIT_MIN_SIGHTINGS:
+                self._headfit_busy = True
+                args = (cam, rows, self.headfit, self.r_room.copy())
+                if self.headfit_sync:
+                    self._headfit_solve(*args)
+                else:
+                    threading.Thread(target=self._headfit_solve, args=args, daemon=True).start()
 
-    def _headcam_finish(self, cam: str) -> None:
-        samples, self.headcal = self.headcal["samples"], None
-        n = len(samples)
-        if n < 15:
-            self.headcal_result = {"ok": False, "samples": n, "error":
-                                   "too few moments where the head camera and two fixed cameras saw the same hand"}
-            return
-        r_list, m_list = [s[0] for s in samples], [s[2] for s in samples]
-        spread = hc.head_spread_deg(m_list)
-        if spread < 20.0:
-            self.headcal_result = {"ok": False, "samples": n, "error":
-                                   f"the head only turned {spread:.0f} degrees: look around more while calibrating"}
-            return
-        # Two passes: solve, drop the samples that fit worst (a wrong hand match), solve again.
-        a, b, mean_err, worst = hc.solve_alignment(r_list, m_list)
-        errs = np.array([hc.rotation_angle_deg(a @ m @ b, r) for r, m in zip(r_list, m_list)])
-        keep = errs <= max(np.percentile(errs, 80), 4.0)
-        if keep.sum() >= 12:
-            a, b, mean_err, worst = hc.solve_alignment([r for r, kp in zip(r_list, keep) if kp],
-                                                       [m for m, kp in zip(m_list, keep) if kp])
-        if mean_err > 8.0:
-            self.headcal_result = {"ok": False, "samples": n, "error":
-                                   f"the camera and the motion sensors disagree by {mean_err:.0f} degrees"}
-            return
-        offs = [(a @ s[2]).T @ (s[1] - s[3]) for s, kp in zip(samples, keep) if kp and s[4]]
-        offset = np.median(offs, axis=0) if len(offs) >= 5 else np.array([0.0, 0.0, -0.08])
-        self.config.update({"extra_cameras": {cam: {
-            "calibrated": True, "align": a.reshape(9).tolist(), "rot": b.reshape(9).tolist(), "tvec": offset.tolist()}}})
-        self.headcal_result = {"ok": True, "samples": n, "used": int(keep.sum()), "head_turn_deg": round(spread),
-                               "rotation_error_deg": round(mean_err, 1), "worst_deg": round(worst, 1),
-                               "offset_from_eyes_m": np.round(offset, 3).tolist(),
-                               "offset_measured": len(offs) >= 5}
+    def _headfit_solve(self, cam: str, rows: list, current, r_room: np.ndarray) -> None:
+        """Runs beside the tracking (it can take a second the first time)."""
+        try:
+            grp = np.array([r[1] for r in rows])
+            d, x, m, h = (np.array([r[i] for r in rows]) for i in (2, 3, 4, 5))
+            turned = hc.head_spread_deg(list(m[:: max(1, len(m) // 60)]))
+            c = self.config.get()["extra_cameras"][cam]
+            stored = (np.array(c["rot"]).reshape(3, 3), np.array(c["tvec"])) if c["calibrated"] else None
+            # The runtime's world and the room both have "up" about right, so A is a turn
+            # about the vertical, give or take; every heading is tried when none is known.
+            headings = [r_room.T @ g.rot_y(y) for y in np.radians(np.arange(0, 360, 30))]
+            full = turned >= HEADFIT_FULL_TURN_DEG
+            # With the head still, a wrong mount and a wrong heading can cancel out for the
+            # one direction being looked in, and fall apart at the next glance aside. So
+            # the mount, remembered from last time or not, counts for nothing until a fit
+            # with the head turning has confirmed it; after that the heading alone is
+            # followed while the head is still.
+            if not full and not (self.headfit_mount_ok and current is not None):
+                self.headfit_note = "learning: look around a little (up, down and sideways) with a hand in view"
+                return
+            grid = [(a, b, np.zeros(3)) for a in headings for b in hc.MOUNT_GUESSES]
+            if current is not None:
+                inits = [(current["a"], current["b"], current["off"])]
+            elif stored is not None:
+                inits = [(a, stored[0], stored[1]) for a in headings]
+            else:
+                inits = grid
+            fit = hc.solve_mount(d, x, m, h, grp, inits, fix_mount=not full)
+            if full and inits is not grid and (fit is None or fit["err_deg"] > HEADFIT_GOOD_DEG):
+                fit = hc.solve_mount(d, x, m, h, grp, grid)  # what was remembered no longer holds
+            mount = stored if current is None else (current["b"], current["off"])
+            now = time.monotonic()
+            if fit is not None and fit["err_deg"] <= HEADFIT_GOOD_DEG and fit["used"] >= HEADFIT_MIN_SIGHTINGS * 0.6:
+                fit["t"], fit["turned_deg"] = now, round(turned)
+                first_mount = mount is None or not c["calibrated"]
+                moved = mount is not None and hc.rotation_angle_deg(mount[0], fit["b"]) > 1.5
+                with self.lock:
+                    self.headfit = fit
+                    self.headfit_mount_ok = self.headfit_mount_ok or full
+                    self.headfit_serial += 1
+                    self.headfit_note = "tracking"
+                if full and (first_mount or moved):  # remember how the camera sits in the headset
+                    self.config.update({"extra_cameras": {cam: {
+                        "calibrated": True, "align": fit["a"].reshape(9).tolist(),
+                        "rot": fit["b"].reshape(9).tolist(), "tvec": fit["off"].tolist()}}})
+            elif current is not None:
+                # No better fit. Is the one in use still right for what is seen now?
+                e, _ = hc.bearing_errors(current["a"], current["b"], current["off"], d, x, m, h)
+                best = [float(e[grp == n].min()) for n in np.unique(grp)]
+                if float(np.percentile(best, 50)) > HEADFIT_LOST_DEG:
+                    with self.lock:
+                        self.headfit = None
+                        self.headfit_mount_ok = False
+                        self.headfit_note = "lost (headset reseated or its heading reset): learning again"
+        finally:
+            self._headfit_busy = False
 
     def _hand_agreement(self, cam: str, idx: int, t: float, ext: dict) -> None:
         """Calibration health from a hand seen by this camera and another at once. Hand
@@ -859,9 +989,60 @@ class Hub:
         ext = {n: (v.ext if v.ext is not None else ext[n]) for n, v in fresh.items()}
         lead = max(fresh, key=lambda n: fresh[n].score)  # best view: gestures and single-view fallback
         pts_ref, err, mode, used = None, 0.0, "single", [lead]
-        if len(fresh) >= 2:
+        # Where the palm is by the fixed cameras alone: what the head camera is fitted to.
+        steady = [n for n, v in fresh.items() if v.ext is None]
+        if len(steady) >= 2:
+            solc = mv.triangulate_robust(
+                [(fresh[n].k, *ext[n], fresh[n].image_at(t)[g.PALM_IDS], fresh[n].score) for n in steady], 12.0)
+            if solc is not None:
+                self.hands[idx].centre_fixed, self.hands[idx].centre_t = solc[0].mean(axis=0), t
+        scale_of = {n: trk["hand_scale"] for n in fresh}
+        # The head camera sees the hand from close by and from the wearer's side: nothing
+        # shows the fingers better. The fixed cameras stand far off and around: nothing
+        # places the hand in the room better. So with the head camera on the hand, its
+        # view gives the hand's shape and orientation, and the fixed cameras (or, with
+        # only one of them, that one and the head camera) give where the palm is.
+        head = next((n for n, v in fresh.items() if v.ext is not None), None)
+        if head is not None:
+            lead = head
+            scale_of[head] = trk["hand_scale"] * self._head_hand_scale(idx)
+            hv = fresh[head]
+            solh = g.solve_hand_pnp(hv.world, hv.image, hv.k, scale_of[head])
+            if solh is not None:
+                shape_ref = solh[0] @ ext[head][0].T + ext[head][1]
+                self._learn_head_hand_scale(idx, shape_ref[0], ext[head][1])
+                # A hand cannot be further from the wearer's face than the arm is long.
+                reach = 0.46 * trk["user_height_m"] if trk["user_height_m"] > 0.5 else 0.85
+                ray = shape_ref[0] - ext[head][1]
+                rng = float(np.linalg.norm(ray))
+                if rng > reach:
+                    shape_ref = shape_ref - ray / rng * (rng - reach)
+                fixed = [n for n in fresh if n != head]
+                for names in ([fixed] if len(fixed) >= 2 else []) + ([list(fresh)] if len(fresh) >= 2 else []):
+                    # The head camera and a camera it is facing look along the same line
+                    # from its two ends: together they say nothing about how far along.
+                    if len(names) == 2 and head in names:
+                        other = names[0] if names[1] == head else names[1]
+                        to_hand = [g.normalize(shape_ref[0] - ext[n][1]) for n in (head, other)]
+                        if abs(float(to_hand[0] @ to_hand[1])) > math.cos(math.radians(25.0)):
+                            continue
+                    sol = mv.triangulate_robust(
+                        [(fresh[n].k, *ext[n], fresh[n].image_at(t)[g.PALM_IDS], fresh[n].score) for n in names],
+                        TRIANGULATION_MAX_RMS_PX)
+                    if sol is None:
+                        continue
+                    centre = sol[0].mean(axis=0)
+                    moved = shape_ref + (centre - shape_ref[g.PALM_IDS].mean(axis=0))
+                    # the palm must still be in front of the head camera, about where it saw it
+                    if (float(np.linalg.norm(moved[0] - shape_ref[0])) < 0.35
+                            and float(np.linalg.norm(moved[0] - ext[head][1])) < reach + 0.10):
+                        pts_ref, err, mode = moved, sol[1], "triangulated"
+                        used = sorted({names[i] for i in sol[2]} | {head}, key=list(self.cams).index)
+                        break
+            used = used if pts_ref is not None else [lead]
+        if pts_ref is None and len(fresh) >= 2:
             names = list(fresh)
-            sol = mv.triangulate_robust([(fresh[n].k, *ext[n], fresh[n].image, fresh[n].score) for n in names],
+            sol = mv.triangulate_robust([(fresh[n].k, *ext[n], fresh[n].image_at(t), fresh[n].score) for n in names],
                                         TRIANGULATION_MAX_RMS_PX)
             # No agreeing set of views means a wrong hand was matched, or fast motion
             # between unsynchronized frames: fall back to the best single view then.
@@ -878,7 +1059,7 @@ class Hub:
                     used = sorted((names[i] for i in sol[2]), key=list(self.cams).index)
         if pts_ref is None:
             v = fresh[lead]
-            sol = g.solve_hand_pnp(v.world, v.image, v.k, trk["hand_scale"])
+            sol = g.solve_hand_pnp(v.world, v.image, v.k, scale_of[lead])
             if sol is None:
                 return
             r, tv = ext[lead]
@@ -933,6 +1114,29 @@ class Hub:
             if float(np.linalg.norm(palm - self.head_pos)) < near:
                 return
 
+        # Fingers: the head camera's view of them, while it has one. A frame from the
+        # fixed cameras in between moves the hand but must not swap in their coarser idea
+        # of its shape, or the fingers would flicker between the two.
+        hp = self.hands[idx]
+        from_head = head is not None and lead == head
+        if from_head:
+            hp.head_shape, hp.head_shape_t = pts_ref - pts_ref[g.PALM_IDS].mean(axis=0), t
+        elif hp.head_shape is not None and 0.0 <= t - hp.head_shape_t < HEAD_SHAPE_HOLD_S:
+            pts_ref = hp.head_shape + pts_ref[g.PALM_IDS].mean(axis=0)
+        held_shape = not from_head and hp.head_shape is not None and 0.0 <= t - hp.head_shape_t < HEAD_SHAPE_HOLD_S
+
+        # Change of source: stay put, then drift (see HANDOVER_TAU_S).
+        key = (mode.split("+")[0], tuple(used), self.headfit_serial if head is not None else 0)
+        if hp.state.tracked and 0.0 < t - hp.last_t < 0.3:
+            hp.carry = hp.carry * math.exp(-(t - hp.last_t) / HANDOVER_TAU_S)
+            if key != hp.path_key:
+                step = hp.lm_ref[0] - (pts_ref[0] + hp.carry)
+                hp.carry = hp.carry + step if float(np.linalg.norm(step)) < HANDOVER_MAX_M else np.zeros(3)
+        else:
+            hp.carry = np.zeros(3)
+        hp.path_key = key
+        pts_ref = pts_ref + hp.carry
+
         # A hand does not teleport. A sudden leap is almost always one bad frame (a wrong
         # match, a camera dropping out): skip it. If the new place persists for a few
         # frames it is real (tracking had been wrong, or was just re-acquired) and is taken.
@@ -955,14 +1159,16 @@ class Hub:
             f.min_cutoff, f.beta, f.d_cutoff = (cfg["smoothing"][n] for n in ("min_cutoff", "beta", "d_cutoff"))
         h.raw_pos, h.lm_body = pos, pts
         h.lm_ref = pts_ref
-        # Known from the fixed cameras alone: usable to locate the head camera.
-        h.ref_fixed = mode == "triangulated" and all(fresh[n].ext is None for n in used)
         h.lm_room = pts_ref @ r_cb.T  # room axes relative to the webcam, like the body and cameras
         h.reproj_px = err
         h.mode, h.views_used = mode, used
         h.height_px = float(np.ptp(v.image[:, 1]))
         h.confidence = v.score * g_clamp(1.0 - err / 25.0)
-        go = h.gestures.update(v.world, cfg["gestures"], h.confidence >= trk["min_confidence"])
+        if held_shape and h.last_go is not None:
+            go = h.last_go  # pinch and grip, too, are read from the head camera while it sees the hand
+        else:
+            go = h.gestures.update(v.world, cfg["gestures"], h.confidence >= trk["min_confidence"])
+            h.last_go = go if from_head else None
         h.pinch = go.pinch
         h.last_seen = time.monotonic()
         h.last_t = t
@@ -1117,6 +1323,7 @@ class Hub:
         v = g.BASE_CAM_TO_BODY @ (r_room.T @ g.normalize(up_room))  # up, in the untilted camera axes
         roll = math.atan2(v[0], v[1])
         pitch = math.atan2(-v[2], math.hypot(v[0], v[1]))
+        self.eye_y_samples.clear()  # the room's axes are about to change
         self.config.update({"camera": {"pitch_deg": math.degrees(pitch), "roll_deg": math.degrees(roll),
                                        "yaw_deg": 0.0}})
         out = {"ok": True, "pitch_deg": round(math.degrees(pitch), 1), "roll_deg": round(math.degrees(roll), 1)}
@@ -1193,13 +1400,43 @@ class Hub:
         self.recentre_seq += 1
         return {"ok": True, "recentre_seq": self.recentre_seq}
 
+    def _head_hand_scale(self, idx: int) -> float:
+        """How much bigger or smaller this hand is than the hand tracker assumes, learnt
+        from the moments when the skeleton's wrist told how far the hand really was."""
+        r = self.head_hand_ratios[idx]
+        return float(np.clip(np.median(r), 0.7, 1.4)) if len(r) >= 30 else 1.0
+
+    def _learn_head_hand_scale(self, idx: int, wrist_ref: np.ndarray, cam_centre: np.ndarray) -> None:
+        """One camera judges a hand's distance by its size, so a hand larger than the
+        tracker's model looks nearer than it is. The skeleton's wrist, measured by the
+        fixed cameras, gives the true distance from the head camera: the ratio of the
+        two, gathered over time, is the size of this user's hand."""
+        w = 16 if idx == 1 else 15
+        if not self.body_ok or time.monotonic() - self.body_seen[w] > 0.15:
+            return
+        seen = float(np.linalg.norm(wrist_ref - cam_centre)) / self._head_hand_scale(idx)
+        true = float(np.linalg.norm(self.r_room.T @ self.body_pts[w] - cam_centre))
+        if 0.15 < seen < 1.2 and 0.15 < true < 1.2 and 0.5 < true / seen < 2.0:
+            self.head_hand_ratios[idx].append(true / seen)
+
+    def _floor(self, cfg: dict):
+        """Room height of the floor: the user's eye height (their height less 11 cm) below
+        their standing eye level, or, with no height given, under the feet two cameras see."""
+        # The height comes first when it is known: a camera that cannot see the feet still
+        # reports where it guesses them to be, and a floor found from such feet can sit
+        # half a metre too high.
+        height = float(cfg["tracking"]["user_height_m"])
+        if height > 0.5 and len(self.eye_y_samples) >= 60:
+            return round(float(np.percentile(self.eye_y_samples, 90)) - (height - 0.11), 3)
+        return None if self.floor_y is None else round(self.floor_y, 3)
+
     def _world_yaw(self, cfg: dict):
         """Angle (radians, about +y) turning the VR runtime's world into room axes, or None."""
-        hs = cfg["extra_cameras"].get("headset")
-        if not hs or not hs["calibrated"]:
+        fit = self._headfit_usable()
+        if fit is None:
             return None
         c = cfg["camera"]
-        r = g.cam_to_body_rotation(c["yaw_deg"], c["pitch_deg"], c["roll_deg"]) @ np.array(hs["align"]).reshape(3, 3)
+        r = g.cam_to_body_rotation(c["yaw_deg"], c["pitch_deg"], c["roll_deg"]) @ fit["a"]
         fwd = r @ np.array([0.0, 0.0, -1.0])
         return round(math.atan2(-fwd[0], -fwd[2]), 4)
 
@@ -1293,12 +1530,19 @@ class Hub:
                 "game": {"recentre_seq": self.recentre_seq, "world_yaw": self._world_yaw(cfg),
                          "torso_yaw": round(self.torso_yaw, 4),
                          "torso_tracked": time.monotonic() - self.torso_seen < BODY_HOLD_S and self.body_ok,
-                         "floor_y": None if self.floor_y is None else round(self.floor_y, 3)},
+                         "floor_y": self._floor(cfg)},
+                "head_hand_scale": [round(self._head_hand_scale(i), 3) for i in range(2)],
+                "head_hand_samples": [len(r) for r in self.head_hand_ratios],
                 "headcam": {
-                    "collecting": self.headcal is not None,
-                    "seconds_left": round(max(self.headcal["until"] - time.monotonic(), 0.0), 1) if self.headcal else 0.0,
-                    "samples": len(self.headcal["samples"]) if self.headcal else 0,
-                    "result": self.headcal_result,
+                    "collecting": self.headfit is None,
+                    "seconds_left": 0.0,
+                    "samples": len({r[1] for r in self.head_sightings}),
+                    "note": self.headfit_note,
+                    "result": None if self.headfit is None else {
+                        "ok": True, "rotation_error_deg": round(self.headfit["err_deg"], 1),
+                        "used": self.headfit["used"], "head_turn_deg": self.headfit.get("turned_deg"),
+                        "age_s": round(time.monotonic() - self.headfit["t"], 1),
+                        "offset_from_eyes_m": np.round(self.headfit["off"], 3).tolist()},
                 },
                 "multicam": {
                     "collecting": self.collector is not None,

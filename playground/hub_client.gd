@@ -58,6 +58,10 @@ var torso_yaw := 0.0              # room axes, radians; 0 = facing the webcam
 var floor_known := false
 var floor_y := 0.0                # height of the floor in room axes (webcam = 0)
 var ignore_yaw := false            # set when the world is already turned to the room's axes
+var body_tracked := false
+var body_points: Array = []       # 33 pose landmarks in room axes (Vector3), or null where unseen
+var _body_t: Array = []            # when each was last seen: a joint missing for a moment stays drawn
+const BODY_HOLD_US := 700000
 var head_tracked := false         # the hub's cameras see the head
 var head_room := Vector3.ZERO     # head relative to the webcam, room axes, metres
 var head_rot_tracked := false
@@ -181,6 +185,22 @@ func _parse_snapshot(text: String, now_us: int) -> void:
 		if hr is Array and hr.size() == 4:
 			head_rot = Quaternion(float(hr[1]), float(hr[2]), float(hr[3]), float(hr[0])).normalized()
 			head_rot_tracked = true
+	var bd: Variant = d.get("body", null)
+	if body_points.size() != 33:
+		body_points.resize(33)
+		body_points.fill(null)
+		_body_t.resize(33)
+		_body_t.fill(0)
+	var pts: Variant = bd.get("points", []) if bd is Dictionary and bool(bd.get("tracked", false)) else []
+	body_tracked = false
+	for i in 33:
+		var p: Variant = pts[i] if pts is Array and i < pts.size() else null
+		if p is Array and p.size() == 3:
+			body_points[i] = Vector3(float(p[0]), float(p[1]), float(p[2]))
+			_body_t[i] = now_us
+		elif now_us - int(_body_t[i]) > BODY_HOLD_US:
+			body_points[i] = null
+		body_tracked = body_tracked or body_points[i] != null
 	var hl: Variant = d.get("hands", [])
 	if hl is Array:
 		for i in mini(2, hl.size()):

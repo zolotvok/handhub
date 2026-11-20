@@ -117,19 +117,26 @@ Works:
 - Body and head tracking in 3D, level and to scale.
 - Hand detection for people standing far from a camera, by searching around the wrists
   the body tracker finds.
+- Crouching and leaning in the playground, at the right eye height, from your height
+  alone when no camera pair sees your feet; your own body drawn as a stick figure there.
 - WiVRn streaming to a Mali phone, surviving backgrounding and the screen timeout.
 
 Does not work well yet:
 
-- **Hand position in play.** Hands are seen by a single camera most of the time, and the
-  estimate still jumps. This is the main open problem.
-- Cameras are not time-synchronised; fast motion smears.
-- No lens distortion model and only nominal fields of view, which hurts near the picture
-  edges and close to a camera.
+- **Hand position in play.** Better than it was, not good enough: on a one-minute
+  recording of real play with two fixed cameras, a hand still leaps more than 10 cm some
+  4 to 14 times. This is the main open problem.
+- Cameras are not time-synchronised. Each view is carried forward along its own motion
+  to make up for it, which helps but does not replace a shared clock.
+- No lens distortion model and only the fields of view you type in (`hfov_deg` per
+  camera). Wrong numbers there hurt everything downstream: the cameras drift apart
+  during play, most near the picture edges and close to a camera.
 - The hub's output reaches only the bundled playground. Feeding hands into WiVRn itself,
   so that ordinary OpenXR and SteamVR games see them, is not written.
-- The headset phone's own camera can be streamed and calibrated in code but has not been
-  made to work in practice.
+- **The headset phone's own camera** (off by default). The hub fits it to the fixed
+  cameras continuously while it runs, and in a slow test that fit holds to under one
+  degree. In real play it sits at 3 to 4 degrees and using it makes the hands worse, not
+  better. It needs the lens numbers above to be right first.
 
 ## Tools
 

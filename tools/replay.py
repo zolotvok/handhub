@@ -29,7 +29,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hub import fusion, geometry as g  # noqa: E402
+from hub import driver_link, fusion, geometry as g  # noqa: E402
 from hub.cameras import runner  # noqa: E402
 from hub.config import Config  # noqa: E402
 
@@ -68,6 +68,7 @@ def replay(path: str, overrides: dict, config_patch: dict | None = None) -> dict
     clock = FakeTime()
     fusion.time = clock
     runner.time = clock
+    driver_link.time = clock  # else the headset link looks dead and the head camera is left out
 
     cfg_data = data["config"]
     cfg_data["driver"]["port"], cfg_data["driver"]["status_port"] = free_port(), free_port()

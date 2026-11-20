@@ -26,6 +26,7 @@ var _shots_dir := ""
 var _shot_t := 0.0
 var _seen_recentre_seq := -1
 var _yaw_settled := false
+var _yaw_far_t := 0.0  # how long the torso and the view have disagreed widely
 var _head_offset := Vector3.ZERO
 var _head_quat := Quaternion.IDENTITY
 var _head_quat_ref := Quaternion.IDENTITY
@@ -296,6 +297,59 @@ func _on_button(b: PushButton) -> void:
 
 # ---------------------------------------------------------------- per frame
 
+# The user's body as the cameras measure it, drawn from the shoulders down (the head would
+# only block the view): it shows at a glance whether the game and the room line up.
+const BODY_BONES := [[11, 12, 2], [23, 24, 2], [11, 23, 0], [12, 24, 1],
+		[11, 13, 0], [13, 15, 0], [12, 14, 1], [14, 16, 1],
+		[23, 25, 0], [25, 27, 0], [27, 31, 0], [24, 26, 1], [26, 28, 1], [28, 32, 1]]
+var _bones: Array[MeshInstance3D] = []
+
+
+func _build_body() -> void:
+	var colours := [Color(0.35, 0.65, 1.0), Color(1.0, 0.65, 0.25), Color(0.9, 0.9, 0.95)]   # left, right, middle
+	for b in BODY_BONES:
+		var m := MeshInstance3D.new()
+		var box := BoxMesh.new()
+		box.size = Vector3(0.03, 0.03, 1.0)
+		m.mesh = box
+		var mat := StandardMaterial3D.new()
+		mat.albedo_color = colours[b[2]]
+		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		m.material_override = mat
+		m.visible = false
+		add_child(m)
+		_bones.append(m)
+
+
+func _room_to_world(p: Vector3) -> Vector3:
+	var floor_h := client.floor_y if client.floor_known else client.head_room.y - EYE_H
+	return Vector3(p.x, p.y - floor_h, p.z - WEBCAM_AHEAD)
+
+
+func _update_body() -> void:
+	if _bones.is_empty():
+		_build_body()
+	for i in BODY_BONES.size():
+		var b: Array = BODY_BONES[i]
+		var m := _bones[i]
+		var ok: bool = client.body_tracked and client.body_points.size() > 32 \
+				and client.body_points[b[0]] != null and client.body_points[b[1]] != null
+		m.visible = ok
+		if not ok:
+			continue
+		var p0 := _room_to_world(client.body_points[b[0]])
+		var p1 := _room_to_world(client.body_points[b[1]])
+		var d := p1 - p0
+		var length := d.length()
+		if length < 0.02:
+			m.visible = false
+			continue
+		var z := d / length
+		var up := Vector3.UP if absf(z.y) < 0.95 else Vector3.RIGHT
+		var x := up.cross(z).normalized()
+		m.global_transform = Transform3D(Basis(x, z.cross(x), z * length), (p0 + p1) * 0.5)
+
+
 func _process(delta: float) -> void:
 	if not vr_mode:
 		_move(delta)
@@ -307,6 +361,7 @@ func _process(delta: float) -> void:
 		var h := client.hands[i]
 		visuals[i].update_pose(h.lm_world, h.confidence, h.valid)
 	mirror.update_hands(client)
+	_update_body()
 	grab.step(delta)
 
 	var tips: Array[Vector3] = []
@@ -433,9 +488,15 @@ func _follow_room(delta: float) -> void:
 		fwd.y = 0.0
 		if fwd.length() > 0.2:
 			var err := wrapf(client.torso_yaw - atan2(-fwd.x, -fwd.z), -PI, PI)
-			var rate := 1.5 if absf(err) > deg_to_rad(40.0) or not _yaw_settled else 1.0 / 30.0
+			# Fast only at start-up, or when the two have disagreed widely for a while: a
+			# single bad torso reading, or a glance aside, must not swing the room.
+			_yaw_far_t = _yaw_far_t + delta if absf(err) > deg_to_rad(50.0) else 0.0
+			var rate := 1.0 / 120.0
+			if not _yaw_settled or _yaw_far_t > 3.0:
+				rate = 1.5
 			if absf(err) < deg_to_rad(8.0):
 				_yaw_settled = true
+				_yaw_far_t = 0.0
 			_origin.rotation.y += err * clampf(delta * rate, 0.0, 1.0)
 	elif client.world_yaw_known:
 		_origin.rotation.y = client.world_yaw
@@ -444,7 +505,7 @@ func _follow_room(delta: float) -> void:
 		var target := Vector3(client.head_room.x, clampf(eye_h, 0.3, 2.3), client.head_room.z - WEBCAM_AHEAD)
 		# the play space goes where it puts the headset's own (small) position on the target
 		var want := target - _origin.basis * camera.position
-		_origin.position = _origin.position.lerp(want, clampf(delta * 10.0, 0.0, 1.0))
+		_origin.position = _origin.position.lerp(want, clampf(delta * 25.0, 0.0, 1.0))
 		_head_ref_set = true
 
 

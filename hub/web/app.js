@@ -1169,7 +1169,9 @@ async function alignHeadset() {
 }
 
 // Calibrations the hub collects over time: the camera-to-camera one (progress and result in snapshot.multicam) and the headset
-// camera one (snapshot.headcam, missing on an older hub). Pressing Start first counts down (time to get into position), then POSTs.
+// camera one (snapshot.headcam, missing on an older hub). Pressing Start on the camera one first counts down (time to get into
+// position), then POSTs. The headset one is not a procedure: the hub fits it continuously, so it is a live status line plus a
+// "Learn again" button that POSTs at once (`live: true`, drawn by renderLiveCollector).
 // Each is mounted twice from #tpl-multi (strip under the wall, card on the Calibrate tab, see buildCollectors) and both mounts are
 // drawn by renderCollector from the one state object per calibration below.
 const COUNT_MS = 3000; // ms between pressing Start and the request
@@ -1185,19 +1187,10 @@ const COLLECTORS = {
       : [`${camName(id)}: failed` + (cr.error ? ` - ${cr.error}` : ''), 'err']))]),
   },
   headset: {
-    api: 'headset', total: 25,
+    api: 'headset', live: true,
     state: () => snap?.headcam,
-    waiting: 'No samples yet. Keep one hand in front of you where the headset camera and two other cameras can see it.',
-    rows: (m) => (m.samples > 0 ? [[`${plural(m.samples, 'sample')} so far`]] : []),
-    done: (res) => {
-      if (!res.ok) return [failed(res), []];
-      const n = Number.isFinite, cm = (v) => signed(v * 100), o = res.offset_from_eyes_m;
-      const parts = [n(res.used) && n(res.samples) && `calibrated from ${res.used} of ${res.samples} moments`, n(res.head_turn_deg) && `head turned ${Math.round(res.head_turn_deg)}°`,
-        n(res.rotation_error_deg) && `sensors and camera agree to ${res.rotation_error_deg.toFixed(1)}°`,
-        res.offset_measured && Array.isArray(o) && o.length === 3 && o.every(n) && `camera offset from the eyes: x ${cm(o[0])}, y ${cm(o[1])}, z ${cm(o[2])} cm`].filter(Boolean);
-      return [`Done. Headset camera ${parts.length ? parts.join(', ').replace(/, camera offset/, '; camera offset') : 'calibrated'}.`, []];
-    },
-    // why Start cannot be pressed: the camera is off, the hub is too old, or the hub said there is no VR app (cleared when there is one)
+    waiting: 'Waiting for a hand that the headset camera and two other cameras both see. Wear the headset and look around a little.', // when the hub gives no note
+    // why Learn again cannot be pressed: the camera is off, the hub is too old, or the hub said there is no VR app (cleared when there is one)
     off: (c) => (!camEnabled(CAMS.find((x) => x.id === 'headset'), camOf('headset')) ? 'Turn on the headset camera first (Headset camera settings below).'
       : !snap?.headcam ? 'This hub cannot calibrate the headset camera.' : c.blocked ? 'Start a VR app first.' : ''),
   },
@@ -1215,12 +1208,17 @@ function buildCollectors() {
     const r = refs(el, 'r');
     if (r.hint) r.hint.textContent = $(`[data-calib-text="${c.id}"]`).textContent; // the instruction is written once, on the Calibrate tab
     r.btn.addEventListener('click', () => onCollectorBtn(c));
+    if (c.live) r.btn.classList.remove('primary'); // a rarely needed button, not the main action
     c.uis.push({ r });
     host.append(el);
   }
 }
 
 function onCollectorBtn(c) {
+  if (c.live) { // no countdown: the hub forgets what it learnt at once
+    if (!c.pending) { c.error = ''; startCollector(c); }
+    return;
+  }
   if (c.timer) { // second press cancels the countdown
     clearTimeout(c.timer);
     c.timer = c.goAt = 0;
@@ -1233,13 +1231,13 @@ function onCollectorBtn(c) {
 
 async function startCollector(c) {
   c.timer = c.goAt = 0;
-  if (c.state()?.collecting) return; // someone else already started one
+  if (!c.live && c.state()?.collecting) return; // someone else already started one
   c.pending = true;
   const r = await post(c.api);
   c.pending = false;
   if (r.ok) { c.total = r.seconds || c.total; c.busyUntil = performance.now() + 1500; return; }
   c.error = r.error || 'Unknown error.';
-  c.blocked = c.id === 'headset' && /VR|headset orientation/i.test(c.error); // no VR app running: wait for one instead of letting Start fail again
+  c.blocked = c.id === 'headset' && /VR|headset orientation/i.test(c.error); // no VR app running: wait for one instead of letting the button fail again
 }
 
 function setRows(ul, rows) { // rows: [text, state?]; rebuilt only when they change
@@ -1249,10 +1247,45 @@ function setRows(ul, rows) { // rows: [text, state?]; rebuilt only when they cha
   ul.replaceChildren(...rows.map(([text, k]) => h('li', k ? { text, 'data-k': k } : { text })));
 }
 
+// The live status of a continuously fitted calibration (the headset camera): [text, state for the border, whether to show the instructions].
+const capFirst = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+const ago = (s) => (s < 1 ? 'just now' : `${s < 120 ? Math.round(s) + ' s' : Math.round(s / 60) + ' min'} ago`);
+function liveStatus(c, m) {
+  const res = !m.collecting && m.result?.ok ? m.result : null;
+  if (!res) { // no usable fit yet: still learning, or lost it
+    const note = String(m.note || c.waiting).trim().replace(/\.+$/, ''), n = Number.isFinite(m.samples) ? m.samples : 0;
+    return [`${capFirst(note)}. ${plural(n, 'sighting')} so far.`, 'wait', true];
+  }
+  const n = Number.isFinite, age = res.age_s, stale = n(age) && age > 60;
+  const parts = [n(res.rotation_error_deg) && `camera and motion sensors agree to ${res.rotation_error_deg.toFixed(1)}°`,
+    n(age) && !stale && `refreshed ${ago(age)}`, n(res.used) && `from ${plural(res.used, 'sighting')}`].filter(Boolean);
+  const text = `In use${parts.length ? ': ' + parts.join(', ') : ''}.` + (stale ? ` Last refreshed ${ago(age)}: show a hand to the cameras to refresh it.` : '');
+  return [text, stale ? 'wait' : 'ok', false];
+}
+
+function renderLiveCollector(c, m, off) {
+  const [text, k, hint] = off || !m ? ['', '', false] : liveStatus(c, m); // when it cannot be used, only the reason is shown
+  for (const { r } of c.uis) {
+    r.btn.disabled = c.pending || !!off;
+    setText(r.btn, 'Learn again');
+    for (const el of [r.count, r.left, r.bar, r.pairs, r.cams]) el.hidden = true; // no countdown, no time left, no progress bar
+    r.note.hidden = !off;
+    if (off) setText(r.note, off);
+    r.error.hidden = !c.error;
+    setData(r.error, 'k', 'err');
+    if (c.error) setText(r.error, 'Failed. ' + c.error);
+    r.result.hidden = !text;
+    setData(r.result, 'k', k);
+    if (text) setText(r.result, text);
+    if (r.hint) r.hint.hidden = !hint || !!c.error || !!off;
+  }
+}
+
 function renderCollector(c) {
   const m = c.state();
   if (c.blocked && (snap?.hmd?.valid || !snap?.hmd)) { c.blocked = false; c.error = ''; } // a VR app is running now
   const off = c.off?.(c) ?? '';
+  if (c.live) { renderLiveCollector(c, m, off); return; }
   const collecting = !!m?.collecting, counting = c.timer !== 0, starting = c.pending || performance.now() < c.busyUntil;
   if (off && counting) onCollectorBtn(c); // the camera was switched off during the countdown: cancel
   const left = Math.max(0, Math.ceil(m?.seconds_left ?? 0));

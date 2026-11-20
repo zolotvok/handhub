@@ -14,9 +14,12 @@ into headset axes (how the camera sits in the headset) and A turns the runtime's
 into the webcam's frame (the runtime's "north" is arbitrary). The camera's position is
 the head position plus a small constant offset expressed in headset axes.
 
-Calibration data are moments when a hand is known in 3D from the fixed cameras and is
-also seen by the head camera: solving that hand's pose in the head camera's picture
-gives the camera's true orientation and position at that moment.
+Calibration data are moments when a hand's palm is known in 3D from the fixed cameras
+and is also seen by the head camera. Each gives one direction: where the head camera saw
+the palm, against where the palm really was. A, B and the offset are fitted to many such
+directions at once (solve_mount). The headset's heading drifts and starts anew with every
+VR session, so the hub keeps fitting while it runs; one hand's pose in one picture
+(camera_pose_from_hand) proved far too coarse for this.
 """
 from __future__ import annotations
 
@@ -92,3 +95,104 @@ def camera_extrinsics(a: np.ndarray, b: np.ndarray, offset_hmd: np.ndarray, m_hm
                       head_ref: np.ndarray):
     """The moving camera's (R ref<-cam, centre in ref) for one moment."""
     return a @ m_hmd @ b, np.asarray(head_ref, float) + a @ m_hmd @ np.asarray(offset_hmd, float)
+
+
+def _rot_vec(v: np.ndarray) -> np.ndarray:
+    theta = float(np.linalg.norm(v))
+    if theta < 1e-12:
+        return np.eye(3)
+    kx, ky, kz = v / theta
+    k = np.array([[0.0, -kz, ky], [kz, 0.0, -kx], [-ky, kx, 0.0]])
+    return np.eye(3) + np.sin(theta) * k + (1.0 - np.cos(theta)) * (k @ k)
+
+
+def _wahba(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """The rotation R that best gives dst ~= R @ src, for rows of unit vectors."""
+    return _nearest_rotation(dst.T @ src)
+
+
+def bearing_errors(a, b, off, d, x, m, h):
+    """Angle (degrees) between where the head camera saw each palm and where it was.
+
+    d: (n, 3) unit directions in the camera's axes; x: (n, 3) palm centres and h: (n, 3)
+    head positions in the reference frame; m: (n, 3, 3) headset orientations.
+    Returns (errors, unit directions from the camera to the palms in the reference frame).
+    """
+    centre = h + np.einsum("ij,njk,k->ni", a, m, off)
+    u = x - centre
+    u = u / np.maximum(np.linalg.norm(u, axis=1), 1e-9)[:, None]
+    seen = np.einsum("ij,njk,kl,nl->ni", a, m, b, d)
+    return np.degrees(np.arccos(np.clip((seen * u).sum(axis=1), -1.0, 1.0))), u
+
+
+def solve_mount(d, x, m, h, group, inits: list, fix_mount: bool = False, keep_share: float = 75.0,
+                off_weight: float = 0.5, off_centre=None):
+    """Fit A, B and the camera's offset to palm sightings.
+
+    group: (n,) sighting number. One sighting of a palm may be listed against both
+    tracked hands when it is not known which one it was; the better-fitting one counts.
+    inits: starting (A, B, offset) triples; the best result is returned.
+    fix_mount: keep B and the offset as given and fit only A (enough to follow the
+    headset's heading drifting, and all that can be told apart while the head is still).
+    Returns {"a", "b", "off", "err_deg" (median over the sightings used), "used"} or None.
+    """
+    d, x, m, h = (np.asarray(v, float) for v in (d, x, m, h))
+    order = np.argsort(np.asarray(group), kind="stable")
+    d, x, m, h, grp = d[order], x[order], m[order], h[order], np.asarray(group)[order]
+    starts = np.flatnonzero(np.r_[True, grp[1:] != grp[:-1]])
+    if len(starts) < 12:
+        return None
+    which = np.cumsum(np.r_[True, grp[1:] != grp[:-1]]) - 1  # sighting index of each row
+
+    def choose(a, b, off):
+        """Rows to use: per sighting the better candidate, less the worst sightings."""
+        e, u = bearing_errors(a, b, off, d, x, m, h)
+        best = np.minimum.reduceat(e, starts)
+        rows = np.flatnonzero((e == best[which]) & (best[which] <= np.percentile(best, keep_share)))
+        return rows, e, u, best
+
+    result = None
+    for a, b, off in inits:
+        a, b, off = np.array(a, float), np.array(b, float), np.array(off, float)
+        for _ in range(12):
+            rows, _, u, _ = choose(a, b, off)
+            a = _wahba(np.einsum("njk,kl,nl->nj", m[rows], b, d[rows]), u[rows])
+            if not fix_mount:
+                b = _wahba(d[rows], np.einsum("nkj,lk,nl->nj", m[rows], a, u[rows]))
+        rows, _, _, best = choose(a, b, off)
+        score = float(np.percentile(best, keep_share * 0.8))
+        if result is None or score < result[0]:
+            result = (score, a, b, off, rows)
+    _, a, b, off, rows = result
+
+    # Refine everything together, now with the offset, on the rows chosen.
+    n_par = 3 if fix_mount else 9
+
+    def residuals(p):
+        ra = _rot_vec(p[0:3]) @ a
+        rb, ro = (b, off) if fix_mount else (b @ _rot_vec(p[3:6]), off + p[6:9])
+        centre = h[rows] + np.einsum("ij,njk,k->ni", ra, m[rows], ro)
+        u = x[rows] - centre
+        u = u / np.maximum(np.linalg.norm(u, axis=1), 1e-9)[:, None]
+        r = (np.einsum("ij,njk,kl,nl->ni", ra, m[rows], rb, d[rows]) - u).reshape(-1)
+        # the camera sits within a hand's width of the eyes: hold the offset loosely there
+        return r if fix_mount else np.r_[r, off_weight * (ro - (0.0 if off_centre is None else off_centre))]
+
+    p = np.zeros(n_par)
+    for _ in range(8):
+        r0 = residuals(p)
+        jac = np.empty((len(r0), n_par))
+        for j in range(n_par):
+            dp = np.zeros(n_par)
+            dp[j] = 1e-5
+            jac[:, j] = (residuals(p + dp) - r0) / 1e-5
+        step = np.linalg.lstsq(jac, -r0, rcond=None)[0]
+        p = p + step
+        if float(np.abs(step).max()) < 1e-6:
+            break
+    a = _rot_vec(p[0:3]) @ a
+    if not fix_mount:
+        b, off = b @ _rot_vec(p[3:6]), off + p[6:9]
+    rows, _, _, best = choose(a, b, off)
+    kept = best[best <= np.percentile(best, keep_share)]
+    return {"a": a, "b": b, "off": off, "err_deg": float(np.median(kept)), "used": int(len(kept))}

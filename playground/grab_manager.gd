@@ -8,9 +8,11 @@ extends Node
 ## lost for > LOST_RELEASE_S) unfreezes it with the palm's recent velocity so it can be thrown.
 
 const GRAB_RADIUS := 0.12
-const LOST_RELEASE_S := 0.3
-const VELOCITY_WINDOW_S := 0.1
-const MAX_THROW_SPEED := 8.0
+const LOST_RELEASE_S := 0.6
+const OPEN_RELEASE_S := 0.2    # the hand must stay open this long: one misread frame is not letting go
+const VELOCITY_WINDOW_S := 0.2
+const MAX_THROW_SPEED := 4.0
+const MIN_THROW_SPEED := 0.7   # slower than this is putting down, not throwing: tracking jitter must not fling things
 const BTN_GRIP := 2
 const RESPAWN_BELOW_Y := -2.0
 const RESPAWN_BEYOND := 6.0
@@ -21,6 +23,7 @@ class HandState extends RefCounted:
 	var last_xf := Transform3D.IDENTITY  # last valid hand frame
 	var prev_grip := false
 	var lost_time := 0.0
+	var open_time := 0.0
 	var history: Array = []              # [time_s, palm position] samples
 
 var client: HubClient
@@ -63,8 +66,12 @@ func step(delta: float) -> void:
 				near_obj[i] = _nearest(h.palm_world)
 				if grip and not s.prev_grip and near_obj[i] != null:
 					_grab(i, near_obj[i], h.palm_world)
-			elif not grip:
-				_release(i, true)
+			elif grip:
+				s.open_time = 0.0
+			else:
+				s.open_time += delta
+				if s.open_time > OPEN_RELEASE_S:
+					_release(i, true)
 			s.prev_grip = grip
 		else:
 			s.history.clear()
@@ -108,6 +115,7 @@ func _nearest(palm: Vector3) -> Grabbable:
 func _grab(i: int, o: Grabbable, palm: Vector3) -> void:
 	var s := _hs[i]
 	s.held = o
+	s.open_time = 0.0
 	s.rel = s.last_xf.affine_inverse() * o.global_transform
 	o.holder = i
 	o.freeze = true
@@ -149,7 +157,8 @@ func _release_velocity(s: HandState) -> Vector3:
 		return Vector3.ZERO
 	var p_last: Vector3 = last[1]
 	var p_first: Vector3 = first[1]
-	return ((p_last - p_first) / dt).limit_length(MAX_THROW_SPEED)
+	var v := (p_last - p_first) / dt
+	return Vector3.ZERO if v.length() < MIN_THROW_SPEED else v.limit_length(MAX_THROW_SPEED)
 
 
 static func _fmt(v: Vector3) -> String:
