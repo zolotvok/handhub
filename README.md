@@ -157,6 +157,9 @@ Does not work well yet:
 - `tools/evaluate.py` replays recordings under several settings side by side and prints
   how often the hands jump, flip or twitch, and how well the estimate predicts the next
   picture. Use it before believing that a change helped.
+- `tools/render_replay.py` renders a recording as a side-by-side video of two settings:
+  the body as a stick figure, both hands, a trail behind each palm and running counts of
+  flips and jumps. No camera pictures are involved.
 
 Recordings contain pictures of you and your room. They are written to
 `~/.local/share/handhub`, outside the repository, on purpose.
