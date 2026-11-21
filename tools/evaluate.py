@@ -4,7 +4,7 @@
 """Score the hub's fusion on raw recordings, for several settings side by side.
 
     .venv/bin/python tools/evaluate.py REC.pkl [REC2.pkl ...] \\
-        [--variant NAME:KEY=VAL,KEY=VAL ...]... [--with-headset] [--json OUT.json]
+        [--variant NAME:KEY=VAL,KEY=VAL ...]... [--with-headset] [--json OUT.json] [--root DIR]
 
 Each recording (POST /api/record/raw) is replayed offline through the hub's fusion once
 per variant; replays run one after another. A variant is a name and a list of overrides:
@@ -31,6 +31,14 @@ picture width: median, 90th percentile, share over 5 % and over 10 %, and the co
 
 By default the camera named "headset" and the "_hmd" events are left out, as if the
 head camera were not there; --with-headset keeps them.
+
+--root DIR scores the hub package in DIR (an older version checked out with git worktree,
+say) instead of the one in the repository this tool lives in, so that this tool as it is
+now can score older code. A version without hub/handfilter.py is fine; a --variant that
+names a module or constant that version does not have is refused with a message. If a
+recording cannot be replayed on that code, the exception's type and message are printed
+in place of its scores, the remaining replays go on, and the exit status is 1. The json
+file then also says which root it was.
 """
 from __future__ import annotations
 
@@ -38,6 +46,7 @@ import argparse
 import ast
 import contextlib
 import copy
+import importlib
 import io
 import itertools
 import json
@@ -47,18 +56,50 @@ import socket
 import sys
 import tempfile
 import time as real_time
+import traceback
 import warnings
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hub import driver_link, fusion, geometry as g, handfilter  # noqa: E402
+
+def find_root(argv: list) -> Path | None:
+    """The DIR of --root DIR among the arguments. It is needed before hub is imported, so
+    before argparse runs in main()."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--root")
+    given, _ = pre.parse_known_args(argv)
+    return Path(given.root).expanduser().resolve() if given.root else None
+
+
+# Where hub comes from: --root when given (and the file is run as a script), else the
+# repository this file is in.
+ROOT = find_root(sys.argv[1:]) if __name__ == "__main__" else None
+if ROOT is not None and not (ROOT / "hub" / "__init__.py").is_file():
+    sys.stderr.write(f"{Path(sys.argv[0]).name}: error: --root {ROOT}: there is no hub/__init__.py in it\n")
+    sys.exit(2)
+sys.path.insert(0, str(ROOT or Path(__file__).resolve().parents[1]))
+
+from hub import driver_link, fusion, geometry as g  # noqa: E402
 from hub.cameras import runner  # noqa: E402
 from hub.config import Config  # noqa: E402
 
-MODULES = {"fusion": fusion, "handfilter": handfilter}
+if ROOT is None:
+    from hub import handfilter  # noqa: E402
+else:
+    if not Path(fusion.__file__).resolve().is_relative_to(ROOT):
+        sys.stderr.write(f"{Path(sys.argv[0]).name}: error: --root {ROOT}: hub was imported from {fusion.__file__}\n")
+        sys.exit(2)
+    try:  # an older version may not have it; one that has it and cannot import it is an error
+        handfilter = importlib.import_module("hub.handfilter")
+    except ModuleNotFoundError as e:
+        if e.name != "hub.handfilter":
+            raise
+        handfilter = None
+
+MODULE_NAMES = ("fusion", "handfilter")
+MODULES = {n: m for n, m in zip(MODULE_NAMES, (fusion, handfilter)) if m is not None}
 MAX_GAP_S = 0.3        # updates further apart than this are not compared
 FLIP_M = 0.03          # a hand's shape changing by more than this between updates is a flip
 HAND_NAMES = ("left", "right")
@@ -107,10 +148,13 @@ def parse_variant(text: str) -> tuple[str, dict]:
         module, dot, const = key.strip().partition(".")
         if not eq or not dot:
             raise ValueError(f"variant {name!r}: {item.strip()!r} is not KEY=VAL with KEY like fusion.CONSTANT")
+        if module not in MODULE_NAMES:
+            raise ValueError(f"variant {name!r}: unknown module {module!r} (use {' or '.join(MODULE_NAMES)})")
+        where = f" in {ROOT}" if ROOT else ""
         if module not in MODULES:
-            raise ValueError(f"variant {name!r}: unknown module {module!r} (use {' or '.join(MODULES)})")
+            raise ValueError(f"variant {name!r}: there is no hub/{module}.py{where}")
         if not hasattr(MODULES[module], const):
-            raise ValueError(f"variant {name!r}: hub/{module}.py has no {const}")
+            raise ValueError(f"variant {name!r}: hub/{module}.py has no {const}{where}")
         try:
             value = ast.literal_eval(raw.strip())
         except (ValueError, SyntaxError):
@@ -161,15 +205,23 @@ def predict_misses(hub, cfg: dict, cam_cfgs: dict, name: str, msg: dict, now: fl
     return [float(cost[0].min())]
 
 
+def use_clock(module, clock) -> None:
+    """Put the recording's clock where the module reads the time; a module that does not read it
+    that way cannot be replayed, and setting the attribute anyway would change nothing."""
+    if not hasattr(module, "time"):
+        raise RuntimeError(f"{module.__name__} has no time module to replace: cannot replay it on the recording's clock")
+    module.time = clock
+
+
 def replay(data: dict, with_headset: bool) -> tuple[dict, list]:
     """One replay of a loaded recording with the constants as they are now.
 
     Returns ({hand index: [(time, landmarks 21x3), ...]}, [prediction misses])."""
     clock = FakeTime()
-    fusion.time = clock
-    runner.time = clock
+    use_clock(fusion, clock)
+    use_clock(runner, clock)
     if with_headset:
-        driver_link.time = clock  # else the headset link looks dead and the head camera is left out
+        use_clock(driver_link, clock)  # else the headset link looks dead and the head camera is left out
 
     cfg_data = copy.deepcopy(data["config"])
     cfg_data["driver"]["port"], cfg_data["driver"]["status_port"] = free_port(), free_port()
@@ -302,7 +354,11 @@ def main() -> int:
                     help="a set of constant overrides to compare (repeatable); KEY is fusion.X or handfilter.X")
     ap.add_argument("--with-headset", action="store_true", help='keep the "headset" camera and the "_hmd" events')
     ap.add_argument("--json", metavar="OUT.json", help="also write all numbers here")
+    ap.add_argument("--root", metavar="DIR", help="score the hub package in DIR (an older checkout, say) "
+                                                  "instead of the one in this repository")
     args = ap.parse_args()
+    if args.root and (ROOT is None or Path(args.root).expanduser().resolve() != ROOT):
+        ap.error("--root only works when this file is run as a script")
 
     try:
         variants = [parse_variant(v) for v in args.variant] or [("default", {})]
@@ -324,10 +380,11 @@ def main() -> int:
     print(LEGEND)
     print(header(rec_w, var_w))
     results = []
+    failed = 0
 
     def save() -> None:
         if args.json:
-            doc = {"with_headset": args.with_headset, "results": results}
+            doc = {"with_headset": args.with_headset, **({"root": str(ROOT)} if ROOT else {}), "results": results}
             Path(args.json).expanduser().write_text(json.dumps(doc, indent=1, default=repr) + "\n")
 
     try:
@@ -336,14 +393,26 @@ def main() -> int:
                 data = pickle.load(f)
             for name, overrides in variants:
                 apply_overrides(originals, overrides)
-                res = evaluate(data, args.with_headset)
+                head = {"recording": path.stem, "path": str(path), "variant": name,
+                        "overrides": {f"{m}.{c}": v for (m, c), v in overrides.items()}}
+                try:
+                    res = evaluate(data, args.with_headset)
+                except Exception as e:
+                    if ROOT is None:
+                        raise
+                    where = traceback.extract_tb(e.__traceback__)[-1]
+                    error = f"{type(e).__name__}: {e} ({Path(where.filename).name}:{where.lineno})"
+                    print(f"{path.stem:<{rec_w}} {name:<{var_w}} | cannot be replayed: {error}", flush=True)
+                    results.append({**head, "error": error})
+                    failed += 1
+                    save()
+                    continue
                 print(line(path.stem, name, res, rec_w, var_w), flush=True)
-                results.append({"recording": path.stem, "path": str(path), "variant": name,
-                                "overrides": {f"{m}.{c}": v for (m, c), v in overrides.items()}, **res})
+                results.append({**head, **res})
                 save()
     finally:
         apply_overrides(originals, {})
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
