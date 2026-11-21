@@ -34,3 +34,6 @@ third_party/
 .idea/
 *.swp
 .DS_Store
+
+# Local working notes (progress log, not for the repository)
+PROGRESS.md
