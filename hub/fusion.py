@@ -22,9 +22,10 @@ from . import headcam as hc
 from . import multiview as mv
 from .cameras.runner import CameraRunner
 from .config import Config
+from .handfilter import MAX_REJECTS, PalmFilter
 from .driver_link import FLAG_FOLLOW_HMD_POSITION, DriverLink, HandState
 from .filters import OneEuro, OneEuroQuat
-from .gestures import GestureDetector
+from .gestures import BTN_GRIP, GestureDetector
 
 REST_TARGET = np.array([0.0, -0.35, -0.35])  # body frame, where "hands in front of the chest" maps
 HEAD_HALF_WIDTH = 0.075  # eye-centre to temple, metres
@@ -47,6 +48,24 @@ VIEW_PREDICT_MAX_S = 0.10    # a view is carried forward along its own motion by
 HANDOVER_TAU_S = 0.4
 HANDOVER_MAX_M = 0.20        # further apart than this is a real correction, taken at once
 HEAD_SHAPE_HOLD_S = 0.25     # fingers stay as the head camera last saw them for this long
+# Where the palm is comes from a running estimate fed by every camera's every picture at
+# its own time (handfilter.py); the per-frame solution above it then only supplies the
+# hand's shape and orientation, and the place to start from.
+POSITION_FILTER = True
+FILTER_PIXEL_SIGMA = 4.0     # how well a fixed camera places the palm, in 640-wide pixels
+FILTER_HEAD_RAY_DEG = 3.0    # the same for the head camera, whose own pose is the uncertain part
+FILTER_RANGE_SHARE = 1.0     # how well a hand's size tells its distance, as a share of the distance: hardly
+FILTER_WRIST_SIGMA_M = 0.07  # how close the palm is to where the skeleton's wrist puts it
+SHAPE_FLIP_DEG = 70.0        # a hand turned by more than this between two frames has not turned: it was misread
+SHAPE_FLIP_FRAMES = 4        # ...unless it stays turned for this many frames
+FINGER_SMOOTH_S = 0.06       # fingers are smoothed in the palm's own frame, so the hand's travel is not delayed
+FIST_LEARN_FRAMES = 8        # a closed hand is shown as the average of its first frames closed, then held
+ARM_AFTER_S = 0.12           # no camera has made the hand out for this long: it goes by the arm
+ARM_MAX_S = 2.0              # ...for at most this long
+ARM_SIGMA_M = 0.05
+PALM_FROM_WRIST_M = 0.07
+SHAPE_TAKEOVER = 1.6         # another camera takes over the hand's shape if it sees the hand this much larger
+FILTER_LOOK_AHEAD = False    # carry the palm on along its velocity to the moment of output
 TRIANGULATION_MAX_RMS_PX = 20.0
 HEAD_IDX = [0, 2, 5, 7, 8, 9, 10]  # head landmarks within the 33 pose landmarks
 SINGLE_KEEP_RANGE_S = 0.6  # a single view keeps the hand's last known distance this long
@@ -124,6 +143,16 @@ class HandTrack:
         self.head_shape: np.ndarray | None = None  # landmarks about the palm centre, as the head camera saw them
         self.head_shape_t = -1e9
         self.last_go = None                  # the gestures read from the head camera's view
+        self.palm = PalmFilter()             # where the palm is (see POSITION_FILTER)
+        self.fed: dict = {}                  # camera -> time of its view last given to the filter
+        self.shape_cam: str | None = None    # the camera whose view shapes the hand at present
+        self.palm_rot: np.ndarray | None = None  # the palm's orientation (reference <- palm) as last believed
+        self.fingers: np.ndarray | None = None   # landmarks in the palm's own frame, smoothed
+        self.fist: np.ndarray | None = None      # the same for the closed hand being held closed
+        self.closed_n = 0
+        self.flip_n = 0
+        self.cam_seen = -1e9                 # when a camera last made this hand out (monotonic)
+        self.arm_ref = None                  # (forearm direction, shape) when the arm took over
         self.leaps = 0  # consecutive frames skipped as implausible leaps
         self.wrong_side = 0.0  # running evidence that this is really the other hand
         self.confidence = 0.0
@@ -354,6 +383,50 @@ class Hub:
             shoulders = float(np.linalg.norm(pts[11] - pts[12]))
             neck = float(np.linalg.norm(pts[0] - (pts[11] + pts[12]) / 2.0))
             self.body_ok = 0.22 <= shoulders <= 0.60 and 0.10 <= neck <= 0.45
+        self._arm_fallback(t, cfg)
+
+    def _arm_fallback(self, t: float, cfg: dict) -> None:
+        """A hand no camera has made out for a moment is still on the end of its arm.
+
+        The body tracker follows the arm when the hand tracker has lost the hand (turned
+        away, blurred, half hidden). Until a camera finds the hand again it is carried
+        on the forearm the skeleton shows, fingers as they last were."""
+        if not (POSITION_FILTER and self.body_ok):
+            return
+        now = time.monotonic()
+        cam, trk = cfg["camera"], cfg["tracking"]
+        for idx, h in enumerate(self.hands):
+            w, e = (16, 14) if idx == 1 else (15, 13)
+            if not h.state.tracked or h.head_shape is None or not h.palm.ok or t <= h.last_t:
+                continue
+            if not ARM_AFTER_S < now - h.cam_seen < ARM_MAX_S:
+                continue
+            if now - self.body_seen[w] > 0.15 or now - self.body_seen[e] > 0.15:
+                continue
+            wrist, elbow = self.r_room.T @ self.body_pts[w], self.r_room.T @ self.body_pts[e]
+            fore = wrist - elbow
+            length = float(np.linalg.norm(fore))
+            if not 0.12 < length < 0.40:
+                continue
+            fore = fore / length
+            if h.arm_ref is None:
+                h.arm_ref = (fore, h.head_shape.copy())
+            # turn the hand with the forearm
+            axis = np.cross(h.arm_ref[0], fore)
+            s_, c_ = float(np.linalg.norm(axis)), float(h.arm_ref[0] @ fore)
+            turn = np.eye(3) if s_ < 1e-6 else hc._rot_vec(axis / s_ * math.atan2(s_, c_))
+            h.palm.near(t, wrist + fore * PALM_FROM_WRIST_M, ARM_SIGMA_M)
+            pts_ref = h.arm_ref[1] @ turn.T + h.palm.position()
+            r_cb = g.cam_to_body_rotation(cam["yaw_deg"], cam["pitch_deg"], cam["roll_deg"])
+            pts = g.cam_to_body(pts_ref, r_cb, self.camera_position(cfg, r_cb))
+            pos, rot = g.controller_pose(pts, trk["roll_offset_deg"], trk["pitch_offset_deg"], trk["grip_offset"])
+            h.raw_pos, h.lm_body, h.lm_ref, h.lm_room = pos, pts, pts_ref, pts_ref @ r_cb.T
+            h.mode, h.views_used = "arm", []
+            h.last_seen, h.last_t = now, t
+            st = h.state
+            h.state = HandState(tracked=True, buttons=st.buttons, pos=h.pos_f(pos, t),
+                                rot=h.rot_f(g.quat_from_matrix(rot), t), trigger=st.trigger, grip=st.grip,
+                                curl=list(st.curl), lm=(pts - pos) @ rot)
 
     def _body_plausible(self, now: float) -> bool:
         pts, ok = self.body_pts, now - self.body_seen < BODY_HOLD_S
@@ -748,6 +821,11 @@ class Hub:
                 # A second sighting of a hand already placed in this frame (one camera's
                 # view of it that did not join the others): it is not the other hand.
                 continue
+            elif POSITION_FILTER and w is None and len(near) == 2:
+                # One camera's hand that could be either of the two (seen from the side
+                # they lie along one line of sight). A guess here drags a hand to the
+                # other's place for a frame; the running estimate does better without it.
+                continue
             elif arm is not None and arm not in assigned and SIDE_PRIORITY == "body":
                 # The arm it is attached to: the skeleton knows its left from its right.
                 idx = arm
@@ -1119,15 +1197,121 @@ class Hub:
         # of its shape, or the fingers would flicker between the two.
         hp = self.hands[idx]
         from_head = head is not None and lead == head
-        if from_head:
+        own: dict = {}
+        # The views that this frame's own solution rests on. Views grouped with them that
+        # did not fit (another hand, as often as not) are kept from the running estimate too.
+        agreed = set(used) | {lead}
+
+        def own_shape(n):
+            """One view's own idea of the whole hand, in the reference frame (or None)."""
+            if n not in own:
+                sol_n = g.solve_hand_pnp(fresh[n].world, fresh[n].image, fresh[n].k, scale_of[n])
+                own[n] = None if sol_n is None else sol_n[0] @ ext[n][0].T + ext[n][1]
+            return own[n]
+
+        if POSITION_FILTER:
+            # One camera at a time says how the hand is turned and how its fingers are
+            # bent. Each camera has its own opinion of that (a small, far hand can look
+            # turned the other way), and letting whichever reported last decide makes the
+            # hand flip about between them. So: the head camera if it sees the hand, else
+            # the camera that has been doing it, for as long as it keeps seeing the hand
+            # (unless another sees it much larger); frames from the others move the hand
+            # without reshaping it.
+            def size_of(n):
+                return float(np.ptp(fresh[n].image, axis=0).max()) / (2.0 * fresh[n].k[0, 2])
+            holding = hp.head_shape is not None and 0.0 <= t - hp.head_shape_t < HEAD_SHAPE_HOLD_S
+            src = head
+            if src is None and hp.shape_cam in fresh:
+                src = hp.shape_cam
+                bigger = max(fresh, key=size_of)
+                if bigger != src and size_of(bigger) > SHAPE_TAKEOVER * size_of(src):
+                    src = bigger
+            if src is None and not holding:
+                src = max(fresh, key=size_of)
+            if src is not None and own_shape(src) is not None:
+                whole = own_shape(src)
+                new = whole - whole[g.PALM_IDS].mean(axis=0)
+                # Split what the camera saw into how the palm is turned and how the fingers
+                # are bent (the landmarks in the palm's own frame): the two go wrong in
+                # different ways and are steadied separately.
+                r_new = g.controller_pose(new)[1]
+                bent, age = new @ r_new, t - hp.head_shape_t
+                if hp.palm_rot is not None and hp.fingers is not None and 0.0 < age < 0.3:
+                    if hc.rotation_angle_deg(hp.palm_rot, r_new) > SHAPE_FLIP_DEG and hp.flip_n < SHAPE_FLIP_FRAMES:
+                        hp.flip_n += 1  # a hand does not turn that far in one frame: not believed yet
+                        r_new, bent = hp.palm_rot, hp.fingers
+                    else:
+                        hp.flip_n = 0
+                    hp.fingers = hp.fingers + (1.0 - math.exp(-age / FINGER_SMOOTH_S)) * (bent - hp.fingers)
+                else:
+                    hp.fingers, hp.flip_n = bent, 0
+                # A hand that reads as closed is shown closed, and stays as it closed until
+                # it reads as open again: the small, half-hidden fingers of a fist are what
+                # the hand tracker is least sure of, and they would twitch.
+                if hp.state.tracked and hp.state.buttons & BTN_GRIP:
+                    hp.closed_n += 1
+                    if hp.fist is None:
+                        hp.fist = hp.fingers.copy()
+                    elif hp.closed_n <= FIST_LEARN_FRAMES:
+                        hp.fist = hp.fist + (hp.fingers - hp.fist) / hp.closed_n
+                    shown = hp.fist
+                else:
+                    hp.closed_n, hp.fist, shown = 0, None, hp.fingers
+                hp.palm_rot = r_new
+                hp.head_shape, hp.head_shape_t, hp.shape_cam = shown @ r_new.T, t, src
+                lead, from_head = src, True  # gestures are read from this view
+            elif not holding:
+                hp.shape_cam = None
+        elif from_head:
             hp.head_shape, hp.head_shape_t = pts_ref - pts_ref[g.PALM_IDS].mean(axis=0), t
-        elif hp.head_shape is not None and 0.0 <= t - hp.head_shape_t < HEAD_SHAPE_HOLD_S:
+        if (not from_head or POSITION_FILTER) and hp.head_shape is not None and 0.0 <= t - hp.head_shape_t < HEAD_SHAPE_HOLD_S:
             pts_ref = hp.head_shape + pts_ref[g.PALM_IDS].mean(axis=0)
         held_shape = not from_head and hp.head_shape is not None and 0.0 <= t - hp.head_shape_t < HEAD_SHAPE_HOLD_S
 
+        if POSITION_FILTER:
+            flt, palm_geo = hp.palm, pts_ref[g.PALM_IDS].mean(axis=0)
+            restarted = False
+            if not flt.ok or t - flt.t > 0.5 or flt.rejects >= MAX_REJECTS or not hp.state.tracked:
+                # Nothing to go on, or the estimate has been contradicted for a while: begin
+                # again from this frame's own solution.
+                flt.start(palm_geo, t, 0.05 if mode.startswith("triangulated") else 0.20)
+                hp.fed = {}
+                restarted = True
+            for n, v in fresh.items():
+                if hp.fed.get(n) == v.t or n not in agreed:
+                    continue  # this picture has had its say, or does not belong
+                hp.fed[n] = v.t
+                r_c, c_c = ext[n]
+                width = 2.0 * v.k[0, 2]
+                xn = (v.image[g.PALM_IDS].mean(axis=0) - v.k[:2, 2]) / v.k[0, 0]
+                moving = v.ext is not None
+                sigma = math.tan(math.radians(FILTER_HEAD_RAY_DEG)) if moving else FILTER_PIXEL_SIGMA * width / 640.0 / v.k[0, 0]
+                flt.see(v.t, r_c, c_c, xn, sigma)
+                sized = own_shape(n)
+                if sized is not None:
+                    rng = float(np.linalg.norm(sized[g.PALM_IDS].mean(axis=0) - c_c))
+                    flt.far(v.t, c_c, rng, FILTER_RANGE_SHARE * rng * (0.6 if moving else 1.0))
+            w = 16 if idx == 1 else 15
+            if self.body_ok and time.monotonic() - self.body_seen[w] < 0.15:
+                # the palm is a few centimetres on from the wrist, the way the hand points
+                flt.near(t, self.r_room.T @ self.body_pts[w] + (palm_geo - pts_ref[0]), FILTER_WRIST_SIGMA_M)
+            palm = flt.position(t if FILTER_LOOK_AHEAD else None)
+            # Beginning again puts the hand somewhere else at a stroke. Shown at once that
+            # is a leap: the shown hand stays where it was and drifts over (HANDOVER_TAU_S).
+            if hp.state.tracked and 0.0 < t - hp.last_t < 0.3:
+                hp.carry = hp.carry * math.exp(-(t - hp.last_t) / HANDOVER_TAU_S)
+                if restarted:
+                    step = hp.lm_ref[g.PALM_IDS].mean(axis=0) - palm
+                    hp.carry = step if float(np.linalg.norm(step)) < 0.5 else np.zeros(3)
+            else:
+                hp.carry = np.zeros(3)
+            pts_ref = pts_ref + (palm + hp.carry - palm_geo)
+
         # Change of source: stay put, then drift (see HANDOVER_TAU_S).
         key = (mode.split("+")[0], tuple(used), self.headfit_serial if head is not None else 0)
-        if hp.state.tracked and 0.0 < t - hp.last_t < 0.3:
+        if POSITION_FILTER:
+            pass
+        elif hp.state.tracked and 0.0 < t - hp.last_t < 0.3:
             hp.carry = hp.carry * math.exp(-(t - hp.last_t) / HANDOVER_TAU_S)
             if key != hp.path_key:
                 step = hp.lm_ref[0] - (pts_ref[0] + hp.carry)
@@ -1168,9 +1352,10 @@ class Hub:
             go = h.last_go  # pinch and grip, too, are read from the head camera while it sees the hand
         else:
             go = h.gestures.update(v.world, cfg["gestures"], h.confidence >= trk["min_confidence"])
-            h.last_go = go if from_head else None
+            h.last_go = go if from_head else None  # held only while one camera is in charge of the shape
         h.pinch = go.pinch
-        h.last_seen = time.monotonic()
+        h.last_seen = h.cam_seen = time.monotonic()
+        h.arm_ref = None
         h.last_t = t
         h.state = HandState(
             tracked=True, buttons=go.buttons,

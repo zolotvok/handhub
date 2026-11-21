@@ -32,9 +32,13 @@ put them, and how well each camera agrees with the others.*
   camera's position from the body landmarks the cameras see at the same time, then refines
   all cameras together. Standing upright once gives it the vertical and, from your height,
   the scale.
-- **Fusion.** A hand seen by two or more cameras is triangulated and kept rigid; a hand
-  seen by one camera keeps its last known distance. Left and right come from the arm the
-  hand is attached to and from the hand's own 3D shape, not from the detector's label.
+- **Fusion.** The cameras never expose at the same instant, and one of them often does
+  not see a hand at all. So each palm's position and velocity are kept as a running
+  estimate (a Kalman filter), and every picture from any camera corrects it at that
+  picture's own time. One camera at a time supplies the hand's shape; a hand no camera
+  can make out stays on the end of the forearm the body tracker sees. Left and right
+  come from where each hand was a moment ago, the arm it is on and its 3D shape, not
+  from the detector's label.
 - **Head position** comes from the cameras too, so crouching and leaning work on a phone
   headset that only knows its orientation.
 
@@ -123,9 +127,15 @@ Works:
 
 Does not work well yet:
 
-- **Hand position in play.** Better than it was, not good enough: on a one-minute
-  recording of real play with two fixed cameras, a hand still leaps more than 10 cm some
-  4 to 14 times. This is the main open problem.
+- **Hand position in play.** Better than it was, not proven good enough: on a
+  one-minute recording of real play with two fixed cameras, a palm still steps more than
+  10 cm some 4 to 10 times (part of that is real fast motion), and where the estimate
+  puts a hand is off from where the next picture finds it by 0.5 % of the picture width
+  in the median, more than 5 % in 3 % of pictures. This is the main open problem.
+- **Camera placement matters more than tuning.** A second camera at 90 degrees to the
+  first sees the hands along one line and often only one of them. Around 45 degrees,
+  with both cameras in front of the player, is the better layout; a third on the other
+  side helps for the same reason.
 - Cameras are not time-synchronised. Each view is carried forward along its own motion
   to make up for it, which helps but does not replace a shared clock.
 - No lens distortion model and only the fields of view you type in (`hfov_deg` per
@@ -143,7 +153,10 @@ Does not work well yet:
 - `tools/record_session.py` records the camera views with the hub's 3D model projected
   back onto them, as a video. The quickest way to see where tracking is wrong.
 - `POST /api/record/raw` records detections (no pictures); `tools/replay.py` re-runs the
-  fusion on such a recording and scores it, so settings can be compared offline.
+  fusion on such a recording and scores it.
+- `tools/evaluate.py` replays recordings under several settings side by side and prints
+  how often the hands jump, flip or twitch, and how well the estimate predicts the next
+  picture. Use it before believing that a change helped.
 
 Recordings contain pictures of you and your room. They are written to
 `~/.local/share/handhub`, outside the repository, on purpose.
